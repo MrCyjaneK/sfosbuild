@@ -1,0 +1,364 @@
+package main
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestNormalizeArch(t *testing.T) {
+	cases := map[string]string{
+		"aarch64": "aarch64",
+		"arm64":   "aarch64",
+		"armv7a":  "armv7hl",
+		"armv7hl": "armv7hl",
+		"armv7":   "armv7hl",
+		"i486":    "i486",
+		"i386":    "i486",
+		"386":     "i486",
+	}
+	for in, want := range cases {
+		got, err := normalizeArch(in)
+		if err != nil || got != want {
+			t.Errorf("normalizeArch(%q)=%q,%v want %q", in, got, err, want)
+		}
+	}
+	if _, err := normalizeArch("riscv64"); err == nil {
+		t.Fatal("expected error for riscv64")
+	}
+}
+
+func TestParseArches(t *testing.T) {
+	got, err := parseArches("all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "aarch64,armv7hl,i486" {
+		t.Fatalf("all: %v", got)
+	}
+	got, err = parseArches("aarch64, armv7a,i486")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "aarch64,armv7hl,i486" {
+		t.Fatalf("list: %v", got)
+	}
+	got, err = parseArches("i486,i386")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "i486" {
+		t.Fatalf("dedup: %v", got)
+	}
+}
+
+func TestParseArgs(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := parseArgs([]string{"5.1.0.11", "armv7a", dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Version != "5.1.0.11" || cfg.Arches[0] != "armv7hl" {
+		t.Fatalf("%+v", cfg)
+	}
+	if cfg.Project != dir {
+		t.Fatalf("project %s", cfg.Project)
+	}
+	if cfg.Output != filepath.Join(dir, "rpms") {
+		t.Fatalf("output %s", cfg.Output)
+	}
+
+	cfg, err = parseArgs([]string{"-o", "/tmp/rpms", "--rebuild", "5.1.0.11", "aarch64,i486", dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Rebuild || cfg.Output != "/tmp/rpms" || len(cfg.Arches) != 2 {
+		t.Fatalf("%+v", cfg)
+	}
+
+	cfg, err = parseArgs([]string{"--help"})
+	if err != nil || cfg != nil {
+		t.Fatalf("help: %v %v", cfg, err)
+	}
+	if _, err := parseArgs([]string{"5.1.0.11", "aarch64"}); err == nil {
+		t.Fatal("expected missing project")
+	}
+	if _, err := parseArgs([]string{"--nope", "5.1.0.11", "all", dir}); err == nil {
+		t.Fatal("expected unknown flag")
+	}
+}
+
+func TestSpecFieldAndPatch(t *testing.T) {
+	meta, err := os.ReadFile("../libreversegearhead/rpm/reversegearhead.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(meta)
+	if got := specField(s, "Name"); got != "reversegearhead" {
+		t.Fatalf("Name=%q", got)
+	}
+	if got := specField(s, "Version"); got != "0.0.0.2022.aacs" {
+		t.Fatalf("Version=%q", got)
+	}
+	patched := patchVersion(s, "1.2.3")
+	if specField(patched, "Version") != "1.2.3" {
+		t.Fatalf("patched version %q", specField(patched, "Version"))
+	}
+	src0 := sourceArchive(s, "reversegearhead", "1.2.3")
+	if src0 != "reversegearhead-1.2.3.tar.bz2" {
+		t.Fatalf("source0 %q", src0)
+	}
+}
+
+func TestFindPkg(t *testing.T) {
+	p, err := findPkg("../libreversegearhead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(p) != "reversegearhead.yaml" {
+		t.Fatalf("got %s", p)
+	}
+	if _, err := findPkg(t.TempDir()); err == nil {
+		t.Fatal("expected missing yaml")
+	}
+}
+
+func TestPrepareStage(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "rpm"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	yaml := `Name: demo
+Version: 1.0
+Sources:
+- '%{name}-%{version}.tar.bz2'
+`
+	yamlPath := filepath.Join(dir, "rpm", "demo.yaml")
+	if err := os.WriteFile(yamlPath, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "demo.so"), []byte("shared"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "demo.h"), []byte("hdr"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	top, script, cleanup, err := prepareStage(dir, yamlPath, yaml, "demo", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if _, err := os.Stat(script); err != nil {
+		t.Fatal(err)
+	}
+	tarPath := filepath.Join(top, "SOURCES", "demo-1.0.tar.bz2")
+	out, err := exec.Command("tar", "-tjf", tarPath).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := string(out)
+	for _, want := range []string{"demo-1.0/demo.so", "demo-1.0/demo.h", "demo-1.0/rpm/demo.yaml"} {
+		if !strings.Contains(list, want) {
+			t.Fatalf("tarball missing %s:\n%s", want, list)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(top, "rpm", "demo.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(top, "SOURCES", "demo.yaml")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrepareStageSource(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.c"), []byte("int main(){}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	yaml := "Name: srcpkg\nVersion: 2\nSources:\n- '%{name}-%{version}.tar.bz2'\n"
+	yamlPath := filepath.Join(dir, "srcpkg.yaml")
+	if err := os.WriteFile(yamlPath, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	top, _, cleanup, err := prepareStage(dir, yamlPath, yaml, "srcpkg", "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	out, err := exec.Command("tar", "-tjf", filepath.Join(top, "SOURCES", "srcpkg-2.tar.bz2")).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "srcpkg-2/main.c") {
+		t.Fatalf("missing source:\n%s", out)
+	}
+}
+
+func TestDockerArgs(t *testing.T) {
+	args := dockerBuildArgs("sfosbuild:5.1.0.11-i486", "/ctx", "5.1.0.11", "i486", "linux/386", "abc", "deadbeef")
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"--platform linux/386",
+		"--build-arg SFOS_VERSION=5.1.0.11",
+		"--build-arg SFOS_ARCH=i486",
+		"--build-arg TARGET_7Z_MD5=abc",
+		"--build-arg SFOSBUILD_IMAGE_HASH=deadbeef",
+		"-t sfosbuild:5.1.0.11-i486",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in %s", want, joined)
+		}
+	}
+
+	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/top", "/script.sh", "/out")
+	joined = strings.Join(run, " ")
+	for _, want := range []string{
+		"run --rm",
+		"--platform linux/386",
+		"-e SFOS_ARCH=i486",
+		"/top:/build",
+		"/script.sh:/usr/bin/sfos-rpmbuild.sh:ro",
+		"/out:/out",
+		"sfosbuild:5.1.0.11-i486 sh /usr/bin/sfos-rpmbuild.sh",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in %s", want, joined)
+		}
+	}
+}
+
+func TestImageTag(t *testing.T) {
+	if got := imageTag("sfosbuild", "5.1.0.11", "aarch64"); got != "sfosbuild:5.1.0.11-aarch64" {
+		t.Fatal(got)
+	}
+}
+
+func TestTarFlag(t *testing.T) {
+	if tarFlag("a.tar.bz2") != "-cjf" || tarFlag("a.tar.gz") != "-czf" {
+		t.Fatal("tar flags")
+	}
+}
+
+func TestFindRoot(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(nested, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := findRoot(nested); err == nil {
+		t.Fatal("expected missing .sfosbuild")
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".sfosbuild"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := findRoot(nested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != root {
+		t.Fatalf("got %s want %s", got, root)
+	}
+}
+
+func TestImageScriptsHash(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".sfosbuild", "image")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	empty := imageScriptsHash(root)
+	if err := os.WriteFile(filepath.Join(dir, "b.sh"), []byte("echo b\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.sh"), []byte("echo a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	h1 := imageScriptsHash(root)
+	if h1 == empty || h1 == "" {
+		t.Fatal(h1)
+	}
+	paths := imageScriptPaths(root)
+	if len(paths) != 2 || !strings.HasSuffix(paths[0], "a.sh") {
+		t.Fatalf("sorted paths %v", paths)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.sh"), []byte("echo a2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	h2 := imageScriptsHash(root)
+	if h1 == h2 {
+		t.Fatal("hash should change when a script changes")
+	}
+}
+
+func TestParseShellArgs(t *testing.T) {
+	cfg, cmd, err := parseShellArgs([]string{"--rebuild", "5.1.0.11", "armv7a", "sh", "-c", "pwd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Rebuild || cfg.Version != "5.1.0.11" || cfg.Arches[0] != "armv7hl" {
+		t.Fatalf("%+v", cfg)
+	}
+	if strings.Join(cmd, " ") != "sh -c pwd" {
+		t.Fatalf("cmd %v", cmd)
+	}
+	if _, _, err := parseShellArgs([]string{"5.1.0.11", "all"}); err == nil {
+		t.Fatal("expected all rejected")
+	}
+	if _, _, err := parseShellArgs([]string{"5.1.0.11"}); err == nil {
+		t.Fatal("expected missing arch")
+	}
+	cfg, cmd, err = parseShellArgs([]string{"5.1.0.11", "i486"})
+	if err != nil || len(cmd) != 0 || cfg.Arches[0] != "i486" {
+		t.Fatalf("%v %v %v", cfg, cmd, err)
+	}
+}
+
+func TestDockerShellArgs(t *testing.T) {
+	wd := "/home/user/work/reversegearhead"
+	pwd := wd + "/libreversegearhead"
+	args := dockerShellArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", wd, pwd, []string{"uname", "-m"}, false)
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"run --rm",
+		"--platform linux/386",
+		"-v " + wd + ":" + wd,
+		"-w " + pwd,
+		"sfosbuild:5.1.0.11-i486 uname -m",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in %s", want, joined)
+		}
+	}
+	if strings.Contains(joined, " -t ") || strings.Contains(joined, "-it") {
+		t.Fatal("no tty")
+	}
+	if !strings.Contains(joined, " -i ") && !strings.Contains(joined, "run --rm -i") {
+		t.Fatalf("stdin should be attached: %s", joined)
+	}
+	args = dockerShellArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", wd, pwd, nil, true)
+	joined = strings.Join(args, " ")
+	if !strings.Contains(joined, " -t") || !strings.HasSuffix(joined, " sh -i") {
+		t.Fatalf("interactive sh: %s", joined)
+	}
+}
+
+func TestUsage(t *testing.T) {
+	var b strings.Builder
+	usage(&b)
+	s := b.String()
+	for _, want := range []string{
+		"sfosbuild shell",
+		".sfosbuild/",
+		".sfosbuild/image/*.sh",
+		"-v $wd:$wd",
+		"-w $PWD",
+		"sfosbuild build",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("help missing %q", want)
+		}
+	}
+}
