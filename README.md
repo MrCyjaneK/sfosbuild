@@ -15,6 +15,7 @@ Usage:
   sfosbuild [options] <sfos-version> <arch[,arch...]|all> <project>
   sfosbuild build [options] <sfos-version> <arch[,arch...]|all> <project>
   sfosbuild shell [options] <sfos-version> <arch> [command...]
+  sfosbuild deploy [options] <user@host> <project>
 ```
 
 ## Hooks

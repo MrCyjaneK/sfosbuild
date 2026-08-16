@@ -1,19 +1,10 @@
 #!/bin/sh
-# Install rpm-build and spectacle (specify) into the SDK target rootfs.
+# Bootstrap the SDK target rootfs for sfosbuild.
 # ssu plugin repos need Jolla credentials; use the public release mirrors.
 set -eu
 
 SFOS_VERSION="${SFOS_VERSION:-5.1.0.11}"
 SFOS_ARCH="${SFOS_ARCH:-aarch64}"
-
-need=false
-command -v rpmbuild >/dev/null || need=true
-command -v tar >/dev/null || need=true
-command -v specify >/dev/null || need=true
-if [ "$need" = false ]; then
-	rpm --rebuilddb || true
-	exit 0
-fi
 
 ssu dr customer-jolla 2>/dev/null || true
 ssu dr apps 2>/dev/null || true
@@ -34,6 +25,9 @@ zypper ar -f "https://releases.jolla.com/releases/${SFOS_VERSION}/jolla-hw/adapt
 zypper --non-interactive --gpg-auto-import-keys refresh
 
 zypper --non-interactive in --force-resolution \
+	patterns-sailfish-development-tools \
+	make \
 	tar \
-	rpm-build \
 	spectacle
+
+rpm --rebuilddb || true

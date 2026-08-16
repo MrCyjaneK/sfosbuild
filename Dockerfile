@@ -31,12 +31,6 @@ COPY prepare.sh /usr/bin/sfos-prepare.sh
 RUN rpm --rebuilddb || true \
 	&& sh /usr/bin/sfos-prepare.sh
 
-COPY image-scripts/ /tmp/sfosbuild-image/
 ARG SFOSBUILD_IMAGE_HASH=
 LABEL sfosbuild.image-hash=${SFOSBUILD_IMAGE_HASH}
-RUN for s in /tmp/sfosbuild-image/*.sh; do \
-	if [ -f "$s" ]; then \
-		echo "sfosbuild: image hook $(basename "$s")"; \
-		sh "$s"; \
-	fi; \
-done
+# @@sfosbuild-image-hooks@@

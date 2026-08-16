@@ -13,6 +13,7 @@ func TestNormalizeArch(t *testing.T) {
 		"aarch64": "aarch64",
 		"arm64":   "aarch64",
 		"armv7a":  "armv7hl",
+		"armv7l":  "armv7hl",
 		"armv7hl": "armv7hl",
 		"armv7":   "armv7hl",
 		"i486":    "i486",
@@ -91,11 +92,12 @@ func TestParseArgs(t *testing.T) {
 }
 
 func TestSpecFieldAndPatch(t *testing.T) {
-	meta, err := os.ReadFile("../libreversegearhead/rpm/reversegearhead.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := string(meta)
+	yaml := `Name: reversegearhead
+Version: 0.0.0.2022.aacs
+Sources:
+- '%{name}-%{version}.tar.bz2'
+`
+	s := yaml
 	if got := specField(s, "Name"); got != "reversegearhead" {
 		t.Fatalf("Name=%q", got)
 	}
@@ -113,7 +115,14 @@ func TestSpecFieldAndPatch(t *testing.T) {
 }
 
 func TestFindPkg(t *testing.T) {
-	p, err := findPkg("../libreversegearhead")
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "rpm"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "rpm", "reversegearhead.yaml"), []byte("Name: reversegearhead\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := findPkg(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,6 +226,7 @@ func TestDockerArgs(t *testing.T) {
 	joined = strings.Join(run, " ")
 	for _, want := range []string{
 		"run --rm",
+		"--label sfosbuild=1",
 		"--platform linux/386",
 		"-e SFOS_ARCH=i486",
 		"/top:/build",
@@ -233,6 +243,22 @@ func TestDockerArgs(t *testing.T) {
 func TestImageTag(t *testing.T) {
 	if got := imageTag("sfosbuild", "5.1.0.11", "aarch64"); got != "sfosbuild:5.1.0.11-aarch64" {
 		t.Fatal(got)
+	}
+	if got := imageBuildTag("sfosbuild", "5.1.0.11", "aarch64", "abc123"); got != "sfosbuild:5.1.0.11-aarch64-abc123" {
+		t.Fatal(got)
+	}
+}
+
+func TestBuildDepsHash(t *testing.T) {
+	meta := "Name: demo\nVersion: 1.0\nBuildRequires: gcc\n"
+	h1 := buildDepsHash(meta, "1.0")
+	h2 := buildDepsHash(meta, "2.0")
+	if h1 == h2 || h1 == "" {
+		t.Fatalf("hash should differ with version: %q %q", h1, h2)
+	}
+	h3 := buildDepsHash(meta, "2.0")
+	if h2 != h3 {
+		t.Fatalf("hash unstable: %q %q", h2, h3)
 	}
 }
 
@@ -260,6 +286,25 @@ func TestFindRoot(t *testing.T) {
 	}
 	if got != root {
 		t.Fatalf("got %s want %s", got, root)
+	}
+}
+
+func TestImageHooksDockerfile(t *testing.T) {
+	got := imageHooksDockerfile(nil)
+	if got != "" {
+		t.Fatalf("empty scripts: %q", got)
+	}
+	got = imageHooksDockerfile([]string{"/proj/.sfosbuild/image/0001-a.sh", "/proj/.sfosbuild/image/0002-b.sh"})
+	if !strings.Contains(got, "COPY image-scripts/0001-a.sh /tmp/sfosbuild-image/0001-a.sh") {
+		t.Fatalf("missing first copy: %q", got)
+	}
+	if !strings.Contains(got, "RUN echo \"sfosbuild: image hook 0002-b.sh\" && sh /tmp/sfosbuild-image/0002-b.sh") {
+		t.Fatalf("missing second run: %q", got)
+	}
+	first := strings.Index(got, "0001-a.sh")
+	second := strings.Index(got, "0002-b.sh")
+	if first < 0 || second < 0 || first > second {
+		t.Fatalf("hooks out of order: %q", got)
 	}
 }
 
@@ -345,6 +390,72 @@ func TestDockerShellArgs(t *testing.T) {
 	}
 }
 
+func TestParseDeployArgs(t *testing.T) {
+	dir := t.TempDir()
+	cfg, host, err := parseDeployArgs([]string{"defaultuser@192.168.1.177", dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "defaultuser@192.168.1.177" || cfg.Project != dir {
+		t.Fatalf("%q %+v", host, cfg)
+	}
+	if cfg.Output != filepath.Join(dir, "rpms") {
+		t.Fatalf("output %s", cfg.Output)
+	}
+	if _, _, err := parseDeployArgs([]string{"nohost", dir}); err == nil {
+		t.Fatal("expected user@host error")
+	}
+	if _, _, err := parseDeployArgs([]string{"user@host"}); err == nil {
+		t.Fatal("expected missing project")
+	}
+}
+
+func TestRemoteVersion(t *testing.T) {
+	release := `NAME="Sailfish OS"
+VERSION_ID=5.1.0.11
+SAILFISH_BUILD=11
+`
+	if got := osReleaseField(release, "VERSION_ID"); got != "5.1.0.11" {
+		t.Fatalf("VERSION_ID=%q", got)
+	}
+}
+
+func TestFindMainRPM(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := findMainRPM(dir, "pkg"); err == nil {
+		t.Fatal("expected empty dir error")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pkg-1.0-debuginfo.rpm"), []byte("debug"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	main := filepath.Join(dir, "pkg-1.0.rpm")
+	if err := os.WriteFile(main, []byte("pkg"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := findMainRPM(dir, "pkg")
+	if err != nil || got != main {
+		t.Fatalf("got %q err %v", got, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pkg-ts-devel-1.0.rpm"), []byte("ts"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err = findMainRPM(dir, "pkg")
+	if err != nil || got != main {
+		t.Fatalf("subpkg skip: got %q err %v", got, err)
+	}
+	galleryMain := filepath.Join(dir, "sailfish-components-gallery-qt5-1.3.0-1.aarch64.rpm")
+	if err := os.WriteFile(galleryMain, []byte("main"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sailfish-components-gallery-qt5-ts-devel-1.3.0-1.aarch64.rpm"), []byte("ts"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err = findMainRPM(dir, "sailfish-components-gallery-qt5")
+	if err != nil || got != galleryMain {
+		t.Fatalf("got %q want %q err %v", got, galleryMain, err)
+	}
+}
+
 func TestUsage(t *testing.T) {
 	var b strings.Builder
 	usage(&b)
@@ -356,6 +467,7 @@ func TestUsage(t *testing.T) {
 		"-v $wd:$wd",
 		"-w $PWD",
 		"sfosbuild build",
+		"sfosbuild deploy",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("help missing %q", want)

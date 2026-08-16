@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
@@ -10,14 +11,18 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
-//go:embed Dockerfile unpack.sh prepare.sh rpmbuild.sh
+//go:embed Dockerfile unpack.sh prepare.sh rpmbuild.sh install-builddeps.sh
 var embedded embed.FS
+
+const dockerRunLabel = "sfosbuild=1"
 
 var knownMD5 = map[string]string{
 	"5.1.0.11/aarch64": "24b40e5e6c1366996dc5a4a69a46e3b3",
@@ -54,6 +59,9 @@ func run(args []string) error {
 	if len(args) > 0 && args[0] == "shell" {
 		return runShell(args[1:])
 	}
+	if len(args) > 0 && args[0] == "deploy" {
+		return runDeploy(args[1:])
+	}
 	if len(args) > 0 && args[0] == "build" {
 		args = args[1:]
 	}
@@ -64,6 +72,10 @@ func run(args []string) error {
 	if cfg == nil {
 		return nil
 	}
+	return runBuild(cfg)
+}
+
+func runBuild(cfg *config) error {
 	if err := withWorkspace(cfg); err != nil {
 		return err
 	}
@@ -97,9 +109,6 @@ func run(args []string) error {
 
 	for _, arch := range cfg.Arches {
 		log.Printf("%s %s %s", cfg.Version, arch, name)
-		if err := ensureImage(cfg, arch); err != nil {
-			return fmt.Errorf("%s image: %w", arch, err)
-		}
 		if err := buildArch(cfg, arch, pkgPath, string(meta), name, version, outAbs); err != nil {
 			return fmt.Errorf("%s: %w", arch, err)
 		}
@@ -108,13 +117,59 @@ func run(args []string) error {
 	return nil
 }
 
+func runDeploy(args []string) error {
+	cfg, userHost, err := parseDeployArgs(args)
+	if err != nil {
+		return err
+	}
+	if cfg == nil {
+		return nil
+	}
+	arch, err := remoteArch(userHost)
+	if err != nil {
+		return fmt.Errorf("%s arch: %w", userHost, err)
+	}
+	version, err := remoteVersion(userHost)
+	if err != nil {
+		return fmt.Errorf("%s version: %w", userHost, err)
+	}
+	log.Printf("%s is %s %s", userHost, arch, version)
+	cfg.Version = version
+	cfg.Arches = []string{arch}
+	if err := runBuild(cfg); err != nil {
+		return err
+	}
+	outAbs, err := filepath.Abs(cfg.Output)
+	if err != nil {
+		return err
+	}
+	pkgPath, err := findPkg(cfg.Project)
+	if err != nil {
+		return err
+	}
+	meta, err := os.ReadFile(pkgPath)
+	if err != nil {
+		return err
+	}
+	pkgName := specField(string(meta), "Name")
+	if pkgName == "" {
+		return fmt.Errorf("no Name: in %s", pkgPath)
+	}
+	rpm, err := findMainRPM(outAbs, pkgName)
+	if err != nil {
+		return err
+	}
+	return installRPM(userHost, rpm)
+}
+
 func usage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
   sfosbuild [options] <sfos-version> <arch[,arch...]|all> <project>
   sfosbuild build [options] <sfos-version> <arch[,arch...]|all> <project>
   sfosbuild shell [options] <sfos-version> <arch> [command...]
+  sfosbuild deploy [options] <user@host> <project>
 
-Build Sailfish OS RPMs, or open a shell, in SDK target containers.
+Build Sailfish OS RPMs, deploy to a device, or open a shell in SDK target containers.
 
 Workspace:
   Walks up from the current directory looking for .sfosbuild/. That directory
@@ -129,6 +184,7 @@ Workspace:
 
 Commands:
   build (default)  Package a project with specify + rpmbuild
+  deploy           ssh uname -m and /etc/os-release, build, copy RPM, install on device
   shell            docker run -i -t -v $wd:$wd -w $PWD in the SDK image
                    No command -> interactive sh -i. Rebuilds the image if hooks changed.
 
@@ -138,6 +194,7 @@ Examples:
   sfosbuild shell 5.1.0.11 aarch64
   sfosbuild shell 5.1.0.11 i486 uname -m
   sfosbuild shell 5.1.0.11 i486 sh -c 'pwd; ls'
+  sfosbuild deploy defaultuser@192.168.1.177 ./my_sfos_source
 
 Options:
   -o, --output DIR     RPM output directory (default: <project>/rpms)
@@ -222,6 +279,37 @@ func parseArgs(args []string) (*config, error) {
 	return cfg, nil
 }
 
+func parseDeployArgs(args []string) (*config, string, error) {
+	cfg, pos, err := parseFlags(args)
+	if err != nil || cfg == nil {
+		return cfg, "", err
+	}
+	if len(pos) != 2 {
+		usage(os.Stderr)
+		return nil, "", fmt.Errorf("want: sfosbuild deploy <user@host> <project>")
+	}
+	userHost := pos[0]
+	if !strings.Contains(userHost, "@") {
+		return nil, "", fmt.Errorf("want user@host, got %q", userHost)
+	}
+	abs, err := filepath.Abs(pos[1])
+	if err != nil {
+		return nil, "", err
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return nil, "", err
+	}
+	if !st.IsDir() {
+		return nil, "", fmt.Errorf("not a directory: %s", abs)
+	}
+	cfg.Project = abs
+	if cfg.Output == "" {
+		cfg.Output = filepath.Join(abs, "rpms")
+	}
+	return cfg, userHost, nil
+}
+
 func parseShellArgs(args []string) (*config, []string, error) {
 	cfg, pos, err := parseFlags(args)
 	if err != nil || cfg == nil {
@@ -289,6 +377,21 @@ func imageScriptPaths(root string) []string {
 	return matches
 }
 
+const imageHooksMarker = "# @@sfosbuild-image-hooks@@\n"
+
+func imageHooksDockerfile(scripts []string) string {
+	if len(scripts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, s := range scripts {
+		base := filepath.Base(s)
+		fmt.Fprintf(&b, "COPY image-scripts/%s /tmp/sfosbuild-image/%s\n", base, base)
+		fmt.Fprintf(&b, "RUN echo \"sfosbuild: image hook %s\" && sh /tmp/sfosbuild-image/%s\n\n", base, base)
+	}
+	return b.String()
+}
+
 func imageScriptsHash(root string) string {
 	h := sha256.New()
 	for _, f := range imageScriptPaths(root) {
@@ -320,11 +423,9 @@ func runShell(args []string) error {
 	}
 	tag := imageTag(cfg.ImagePrefix, cfg.Version, arch)
 	dargs := dockerShellArgs(tag, archPlatform[arch], arch, cfg.Root, cfg.WorkDir, cmd, len(cmd) == 0)
-	c := exec.Command("docker", dargs...)
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
+	c := dockerCmd(dargs...)
 	c.Stdin = os.Stdin
-	return c.Run()
+	return runCmd(c)
 }
 
 func dockerShellArgs(tag, platform, arch, wd, workdir string, cmd []string, tty bool) []string {
@@ -333,6 +434,7 @@ func dockerShellArgs(tag, platform, arch, wd, workdir string, cmd []string, tty 
 		args = append(args, "-t")
 	}
 	args = append(args,
+		"--label", dockerRunLabel,
 		"--platform", platform,
 		"-e", "SFOS_ARCH="+arch,
 		"-v", wd+":"+wd,
@@ -378,7 +480,7 @@ func normalizeArch(s string) (string, error) {
 	switch strings.ToLower(s) {
 	case "aarch64", "arm64":
 		return "aarch64", nil
-	case "armv7hl", "armv7a", "armv7", "arm":
+	case "armv7hl", "armv7a", "armv7l", "armv7", "arm":
 		return "armv7hl", nil
 	case "i486", "i386", "386", "x86":
 		return "i486", nil
@@ -389,6 +491,16 @@ func normalizeArch(s string) (string, error) {
 
 func imageTag(prefix, version, arch string) string {
 	return prefix + ":" + version + "-" + arch
+}
+
+func imageBuildTag(prefix, version, arch, depsHash string) string {
+	return fmt.Sprintf("%s:%s-%s-%s", prefix, version, arch, depsHash)
+}
+
+func buildDepsHash(meta, version string) string {
+	h := sha256.New()
+	h.Write([]byte(patchVersion(meta, version)))
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 func findPkg(project string) (string, error) {
@@ -421,6 +533,21 @@ func specField(spec, field string) string {
 		}
 		if strings.HasPrefix(strings.ToLower(trim), prefix) {
 			return strings.TrimSpace(trim[len(field)+1:])
+		}
+	}
+	return ""
+}
+
+func osReleaseField(content, key string) string {
+	prefix := key + "="
+	for _, line := range strings.Split(content, "\n") {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, "#") {
+			continue
+		}
+		if strings.HasPrefix(trim, prefix) {
+			v := strings.TrimSpace(trim[len(prefix):])
+			return strings.Trim(v, `"'`)
 		}
 	}
 	return ""
@@ -550,9 +677,7 @@ func prepareStage(project, pkgPath, meta, name, version string) (topdir, script 
 		return "", "", nil, err
 	}
 	cmd := exec.Command("tar", "-C", work, tarFlag(src0), tarPath, folder)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := runCmd(cmd); err != nil {
 		cleanup()
 		return "", "", nil, fmt.Errorf("tar: %w", err)
 	}
@@ -632,7 +757,8 @@ func buildImage(tag, version, arch, root, hash string) error {
 		return err
 	}
 	defer os.RemoveAll(ctx)
-	for _, f := range []string{"Dockerfile", "unpack.sh", "prepare.sh"} {
+	scripts := imageScriptPaths(root)
+	for _, f := range []string{"unpack.sh", "prepare.sh"} {
 		data, err := embedded.ReadFile(f)
 		if err != nil {
 			return err
@@ -641,14 +767,22 @@ func buildImage(tag, version, arch, root, hash string) error {
 			return err
 		}
 	}
+	dockerfile, err := embedded.ReadFile("Dockerfile")
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(string(dockerfile), imageHooksMarker) {
+		return fmt.Errorf("Dockerfile missing %q marker", strings.TrimSpace(imageHooksMarker))
+	}
+	dockerfile = []byte(strings.Replace(string(dockerfile), imageHooksMarker, imageHooksDockerfile(scripts), 1))
+	if err := os.WriteFile(filepath.Join(ctx, "Dockerfile"), dockerfile, 0644); err != nil {
+		return err
+	}
 	scriptDir := filepath.Join(ctx, "image-scripts")
 	if err := os.MkdirAll(scriptDir, 0755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(scriptDir, ".keep"), nil, 0644); err != nil {
-		return err
-	}
-	for _, s := range imageScriptPaths(root) {
+	for _, s := range scripts {
 		if err := cp(s, filepath.Join(scriptDir, filepath.Base(s))); err != nil {
 			return err
 		}
@@ -656,11 +790,7 @@ func buildImage(tag, version, arch, root, hash string) error {
 	md5 := knownMD5[version+"/"+arch]
 	log.Printf("building %s (downloads SDK target)", tag)
 	args := dockerBuildArgs(tag, ctx, version, arch, platform, md5, hash)
-	cmd := exec.Command("docker", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
-	return cmd.Run()
+	return runCmd(dockerCmd(args...))
 }
 
 func dockerBuildArgs(tag, context, version, arch, platform, md5, hash string) []string {
@@ -677,19 +807,92 @@ func dockerBuildArgs(tag, context, version, arch, platform, md5, hash string) []
 	}
 }
 
+func ensureBuildDepsImage(cfg *config, arch, pkgPath, meta, name, version string) (string, error) {
+	base := imageTag(cfg.ImagePrefix, cfg.Version, arch)
+	depsHash := buildDepsHash(meta, version)
+	tag := imageBuildTag(cfg.ImagePrefix, cfg.Version, arch, depsHash)
+	if !cfg.Rebuild && imageExists(tag) && imageBuildDepsHash(tag) == depsHash {
+		log.Printf("image %s", tag)
+		return tag, nil
+	}
+	if imageExists(tag) && !cfg.Rebuild {
+		log.Printf("build requires changed; rebuilding %s", tag)
+	}
+	if err := buildDepsImage(tag, base, arch, pkgPath, meta, version, depsHash); err != nil {
+		return "", err
+	}
+	return tag, nil
+}
+
+func imageBuildDepsHash(tag string) string {
+	out, err := exec.Command("docker", "image", "inspect",
+		"-f", `{{index .Config.Labels "sfosbuild.build-deps-hash"}}`, tag).Output()
+	if err != nil {
+		return ""
+	}
+	s := strings.TrimSpace(string(out))
+	if s == "<no value>" {
+		return ""
+	}
+	return s
+}
+
+func buildDepsImage(tag, base, arch, pkgPath, meta, version, depsHash string) error {
+	ctx, err := os.MkdirTemp("", "sfosbuild-deps-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(ctx)
+
+	scriptBytes, err := embedded.ReadFile("install-builddeps.sh")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(ctx, "install-builddeps.sh"), scriptBytes, 0644); err != nil {
+		return err
+	}
+	pkgName := filepath.Base(pkgPath)
+	if err := os.WriteFile(filepath.Join(ctx, pkgName), []byte(patchVersion(meta, version)), 0644); err != nil {
+		return err
+	}
+	dockerfile := fmt.Sprintf(`FROM %s
+ARG SFOSBUILD_DEPS_HASH=
+COPY install-builddeps.sh /usr/bin/sfos-install-builddeps.sh
+COPY %s /tmp/sfosbuild/%s
+RUN echo "sfosbuild: installing build requires" && sh /usr/bin/sfos-install-builddeps.sh /tmp/sfosbuild/%s
+LABEL sfosbuild.build-deps-hash=${SFOSBUILD_DEPS_HASH}
+`, base, pkgName, pkgName, pkgName)
+	if err := os.WriteFile(filepath.Join(ctx, "Dockerfile"), []byte(dockerfile), 0644); err != nil {
+		return err
+	}
+
+	platform := archPlatform[arch]
+	log.Printf("building %s (build requires)", tag)
+	args := []string{
+		"build",
+		"--platform", platform,
+		"--build-arg", "SFOSBUILD_DEPS_HASH=" + depsHash,
+		"-t", tag,
+		ctx,
+	}
+	return runCmd(dockerCmd(args...))
+}
+
 func buildArch(cfg *config, arch, pkgPath, meta, name, version, out string) error {
 	topdir, script, cleanup, err := prepareStage(cfg.Project, pkgPath, meta, name, version)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
-	tag := imageTag(cfg.ImagePrefix, cfg.Version, arch)
+	if err := ensureImage(cfg, arch); err != nil {
+		return err
+	}
+	tag, err := ensureBuildDepsImage(cfg, arch, pkgPath, meta, name, version)
+	if err != nil {
+		return err
+	}
 	args := dockerRunArgs(tag, archPlatform[arch], arch, topdir, script, out)
-	cmd := exec.Command("docker", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
-	if err := cmd.Run(); err != nil {
+	if err := runCmd(dockerCmd(args...)); err != nil {
 		return fmt.Errorf("docker run: %w", err)
 	}
 	return nil
@@ -698,6 +901,7 @@ func buildArch(cfg *config, arch, pkgPath, meta, name, version, out string) erro
 func dockerRunArgs(tag, platform, arch, topdir, script, out string) []string {
 	args := []string{
 		"run", "--rm",
+		"--label", dockerRunLabel,
 		"--platform", platform,
 		"-e", "SFOS_ARCH=" + arch,
 		"-e", "HOST_UID=" + strconv.Itoa(os.Getuid()),
@@ -718,4 +922,136 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func remoteArch(userHost string) (string, error) {
+	out, err := exec.Command("ssh", userHost, "uname -m").Output()
+	if err != nil {
+		return "", err
+	}
+	return normalizeArch(strings.TrimSpace(string(out)))
+}
+
+func remoteVersion(userHost string) (string, error) {
+	out, err := exec.Command("ssh", userHost, "cat", "/etc/os-release").Output()
+	if err != nil {
+		return "", err
+	}
+	v := osReleaseField(string(out), "VERSION_ID")
+	if v == "" {
+		return "", fmt.Errorf("no VERSION_ID in /etc/os-release")
+	}
+	return v, nil
+}
+
+func findMainRPM(dir, pkgName string) (string, error) {
+	if pkgName == "" {
+		return "", fmt.Errorf("empty package name")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	prefix := pkgName + "-"
+	var candidates []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".rpm") {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) || strings.Contains(name, "debug") {
+			continue
+		}
+		rest := strings.TrimSuffix(name, ".rpm")
+		rest = rest[len(pkgName)+1:]
+		for _, sub := range []string{"doc-", "tests-", "ts-devel-", "debuginfo", "debugsource"} {
+			if strings.HasPrefix(rest, sub) {
+				goto skip
+			}
+		}
+		candidates = append(candidates, filepath.Join(dir, name))
+	skip:
+	}
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("no main rpm for %s in %s", pkgName, dir)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return len(candidates[i]) < len(candidates[j])
+	})
+	return candidates[0], nil
+}
+
+func installRPM(userHost, rpmPath string) error {
+	base := filepath.Base(rpmPath)
+	remote := "RPMS/" + base
+	log.Printf("copying %s to %s:%s", base, userHost, remote)
+	mkdir := exec.Command("ssh", userHost, "mkdir", "-p", "RPMS")
+	if err := runCmd(mkdir); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+	scp := exec.Command("scp", rpmPath, userHost+":"+remote)
+	if err := runCmd(scp); err != nil {
+		return fmt.Errorf("scp: %w", err)
+	}
+	log.Printf("installing on %s (confirm on device)", userHost)
+	var install *exec.Cmd
+	check := exec.Command("ssh", userHost, "command", "-v", "sdk-deploy-rpm")
+	check.Stderr = io.Discard
+	if check.Run() == nil {
+		install = exec.Command("ssh", "-t", userHost, "sdk-deploy-rpm", remote)
+	} else {
+		install = exec.Command("ssh", "-t", userHost, "pkcon", "--plain", "--noninteractive", "install-local", remote)
+	}
+	install.Stdin = os.Stdin
+	if err := runCmd(install); err != nil {
+		return fmt.Errorf("install: %w", err)
+	}
+	rm := exec.Command("ssh", userHost, "rm", "-f", remote)
+	rm.Run()
+	return nil
+}
+
+func dockerCmd(args ...string) *exec.Cmd {
+	cmd := exec.Command("docker", args...)
+	cmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=1")
+	return cmd
+}
+
+func runCmd(cmd *exec.Cmd) error {
+	if cmd.Stdout == nil {
+		cmd.Stdout = os.Stdout
+	}
+	if cmd.Stderr == nil {
+		cmd.Stderr = os.Stderr
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	select {
+	case err := <-waitCh:
+		return err
+	case <-ctx.Done():
+		killSfosbuildDocker()
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		<-waitCh
+		return fmt.Errorf("interrupted")
+	}
+}
+
+func killSfosbuildDocker() {
+	out, err := exec.Command("docker", "ps", "-q", "--filter", "label="+dockerRunLabel).Output()
+	if err != nil {
+		return
+	}
+	ids := strings.Fields(strings.TrimSpace(string(out)))
+	if len(ids) == 0 {
+		return
+	}
+	exec.Command("docker", append([]string{"kill"}, ids...)...).Run()
 }
