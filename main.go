@@ -7,12 +7,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -206,8 +206,10 @@ Architectures: aarch64, armv7hl (armv7a), i486, all
   shell takes a single arch (not all).
 
 The project needs rpm/*.yaml (spectacle). specify runs in the SDK image
-to generate the spec. The project directory is packed as Source0.
-Images are tagged <prefix>:<version>-<arch>.
+to generate the spec. rpmbuild --build-in-place runs in the project
+directory (no Source0 tarball).
+Images are tagged <prefix>_<workspace>:<version>-<arch>, where
+<workspace> is the directory that contains .sfosbuild/.
 `)
 }
 
@@ -421,7 +423,7 @@ func runShell(args []string) error {
 	if err := ensureImage(cfg, arch); err != nil {
 		return err
 	}
-	tag := imageTag(cfg.ImagePrefix, cfg.Version, arch)
+	tag := imageTag(cfg.ImagePrefix, cfg.Root, cfg.Version, arch)
 	dargs := dockerShellArgs(tag, archPlatform[arch], arch, cfg.Root, cfg.WorkDir, cmd, len(cmd) == 0)
 	c := dockerCmd(dargs...)
 	c.Stdin = os.Stdin
@@ -489,12 +491,26 @@ func normalizeArch(s string) (string, error) {
 	}
 }
 
-func imageTag(prefix, version, arch string) string {
-	return prefix + ":" + version + "-" + arch
+var imageNameInvalid = regexp.MustCompile(`[^a-z0-9._-]+`)
+
+func imageRepo(prefix, root string) string {
+	return prefix + "_" + sanitizeImageName(filepath.Base(root))
 }
 
-func imageBuildTag(prefix, version, arch, depsHash string) string {
-	return fmt.Sprintf("%s:%s-%s-%s", prefix, version, arch, depsHash)
+func sanitizeImageName(s string) string {
+	s = strings.Trim(imageNameInvalid.ReplaceAllString(strings.ToLower(s), "-"), "-._")
+	if s == "" {
+		return "workspace"
+	}
+	return s
+}
+
+func imageTag(prefix, root, version, arch string) string {
+	return imageRepo(prefix, root) + ":" + version + "-" + arch
+}
+
+func imageBuildTag(prefix, root, version, arch, depsHash string) string {
+	return fmt.Sprintf("%s:%s-%s-%s", imageRepo(prefix, root), version, arch, depsHash)
 }
 
 func buildDepsHash(meta, version string) string {
@@ -565,43 +581,6 @@ func patchVersion(spec, version string) string {
 	return strings.Join(lines, "\n")
 }
 
-func sourceArchive(meta, name, version string) string {
-	s := specField(meta, "Source0")
-	if s == "" {
-		s = specField(meta, "Source")
-	}
-	if s == "" {
-		for _, line := range strings.Split(meta, "\n") {
-			t := strings.TrimSpace(line)
-			t = strings.TrimPrefix(t, "- ")
-			t = strings.Trim(t, `"'`)
-			if strings.Contains(t, ".tar.") {
-				s = t
-				break
-			}
-		}
-	}
-	s = strings.ReplaceAll(s, "%{name}", name)
-	s = strings.ReplaceAll(s, "%{version}", version)
-	if s == "" {
-		s = name + "-" + version + ".tar.bz2"
-	}
-	return s
-}
-
-func tarFlag(filename string) string {
-	switch {
-	case strings.HasSuffix(filename, ".tar.bz2"), strings.HasSuffix(filename, ".tbz2"):
-		return "-cjf"
-	case strings.HasSuffix(filename, ".tar.gz"), strings.HasSuffix(filename, ".tgz"):
-		return "-czf"
-	case strings.HasSuffix(filename, ".tar.xz"):
-		return "-cJf"
-	default:
-		return "-cf"
-	}
-}
-
 func cp(src, dst string) error {
 	data, err := os.ReadFile(src)
 	if err != nil {
@@ -613,38 +592,7 @@ func cp(src, dst string) error {
 	return os.WriteFile(dst, data, 0644)
 }
 
-func copyTree(src, dst string) error {
-	skip := map[string]bool{".git": true, "dist": true, "rpms": true, "out": true, "vendor": true}
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return os.MkdirAll(dst, 0755)
-		}
-		top := strings.Split(rel, string(filepath.Separator))[0]
-		if skip[top] {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		target := filepath.Join(dst, rel)
-		if d.IsDir() {
-			return os.MkdirAll(target, 0755)
-		}
-		if !d.Type().IsRegular() {
-			return nil
-		}
-		return cp(path, target)
-	})
-}
-
-func prepareStage(project, pkgPath, meta, name, version string) (topdir, script string, cleanup func(), err error) {
+func prepareStage(pkgPath, meta, name, version string) (topdir, script string, cleanup func(), err error) {
 	work, err := os.MkdirTemp("", "sfosbuild-")
 	if err != nil {
 		return "", "", nil, err
@@ -663,24 +611,6 @@ func prepareStage(project, pkgPath, meta, name, version string) (topdir, script 
 			return "", "", nil, err
 		}
 	}
-	folder := name + "-" + version
-	payload := filepath.Join(work, folder)
-	if err := copyTree(project, payload); err != nil {
-		cleanup()
-		return "", "", nil, err
-	}
-
-	src0 := sourceArchive(meta, name, version)
-	tarPath := filepath.Join(topdir, "SOURCES", src0)
-	if err := os.MkdirAll(filepath.Dir(tarPath), 0755); err != nil {
-		cleanup()
-		return "", "", nil, err
-	}
-	cmd := exec.Command("tar", "-C", work, tarFlag(src0), tarPath, folder)
-	if err := runCmd(cmd); err != nil {
-		cleanup()
-		return "", "", nil, fmt.Errorf("tar: %w", err)
-	}
 
 	patched := patchVersion(meta, version)
 	if strings.HasSuffix(pkgPath, ".yaml") {
@@ -690,10 +620,6 @@ func prepareStage(project, pkgPath, meta, name, version string) (topdir, script 
 		}
 		yamlName := name + ".yaml"
 		if err := os.WriteFile(filepath.Join(topdir, "rpm", yamlName), []byte(patched), 0644); err != nil {
-			cleanup()
-			return "", "", nil, err
-		}
-		if err := os.WriteFile(filepath.Join(topdir, "SOURCES", yamlName), []byte(patched), 0644); err != nil {
 			cleanup()
 			return "", "", nil, err
 		}
@@ -718,7 +644,7 @@ func prepareStage(project, pkgPath, meta, name, version string) (topdir, script 
 }
 
 func ensureImage(cfg *config, arch string) error {
-	tag := imageTag(cfg.ImagePrefix, cfg.Version, arch)
+	tag := imageTag(cfg.ImagePrefix, cfg.Root, cfg.Version, arch)
 	hash := imageScriptsHash(cfg.Root)
 	if !cfg.Rebuild && imageExists(tag) && imageHash(tag) == hash {
 		log.Printf("image %s", tag)
@@ -808,9 +734,9 @@ func dockerBuildArgs(tag, context, version, arch, platform, md5, hash string) []
 }
 
 func ensureBuildDepsImage(cfg *config, arch, pkgPath, meta, name, version string) (string, error) {
-	base := imageTag(cfg.ImagePrefix, cfg.Version, arch)
+	base := imageTag(cfg.ImagePrefix, cfg.Root, cfg.Version, arch)
 	depsHash := buildDepsHash(meta, version)
-	tag := imageBuildTag(cfg.ImagePrefix, cfg.Version, arch, depsHash)
+	tag := imageBuildTag(cfg.ImagePrefix, cfg.Root, cfg.Version, arch, depsHash)
 	if !cfg.Rebuild && imageExists(tag) && imageBuildDepsHash(tag) == depsHash {
 		log.Printf("image %s", tag)
 		return tag, nil
@@ -879,7 +805,7 @@ LABEL sfosbuild.build-deps-hash=${SFOSBUILD_DEPS_HASH}
 }
 
 func buildArch(cfg *config, arch, pkgPath, meta, name, version, out string) error {
-	topdir, script, cleanup, err := prepareStage(cfg.Project, pkgPath, meta, name, version)
+	topdir, script, cleanup, err := prepareStage(pkgPath, meta, name, version)
 	if err != nil {
 		return err
 	}
@@ -891,14 +817,14 @@ func buildArch(cfg *config, arch, pkgPath, meta, name, version, out string) erro
 	if err != nil {
 		return err
 	}
-	args := dockerRunArgs(tag, archPlatform[arch], arch, topdir, script, out)
+	args := dockerRunArgs(tag, archPlatform[arch], arch, cfg.Project, topdir, script, out)
 	if err := runCmd(dockerCmd(args...)); err != nil {
 		return fmt.Errorf("docker run: %w", err)
 	}
 	return nil
 }
 
-func dockerRunArgs(tag, platform, arch, topdir, script, out string) []string {
+func dockerRunArgs(tag, platform, arch, project, topdir, script, out string) []string {
 	args := []string{
 		"run", "--rm",
 		"--label", dockerRunLabel,
@@ -906,7 +832,9 @@ func dockerRunArgs(tag, platform, arch, topdir, script, out string) []string {
 		"-e", "SFOS_ARCH=" + arch,
 		"-e", "HOST_UID=" + strconv.Itoa(os.Getuid()),
 		"-e", "HOST_GID=" + strconv.Itoa(os.Getgid()),
-		"-v", topdir + ":/build",
+		"-v", project + ":/build",
+		"-v", topdir + ":/rpmbuild",
+		"-w", "/build",
 		"-v", script + ":/usr/bin/sfos-rpmbuild.sh:ro",
 		"-v", out + ":/out",
 	}

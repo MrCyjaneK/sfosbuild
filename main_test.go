@@ -2,7 +2,6 @@ package main
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -108,10 +107,6 @@ Sources:
 	if specField(patched, "Version") != "1.2.3" {
 		t.Fatalf("patched version %q", specField(patched, "Version"))
 	}
-	src0 := sourceArchive(s, "reversegearhead", "1.2.3")
-	if src0 != "reversegearhead-1.2.3.tar.bz2" {
-		t.Fatalf("source0 %q", src0)
-	}
 }
 
 func TestFindPkg(t *testing.T) {
@@ -155,7 +150,7 @@ Sources:
 		t.Fatal(err)
 	}
 
-	top, script, cleanup, err := prepareStage(dir, yamlPath, yaml, "demo", "1.0")
+	top, script, cleanup, err := prepareStage(yamlPath, yaml, "demo", "1.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,22 +158,14 @@ Sources:
 	if _, err := os.Stat(script); err != nil {
 		t.Fatal(err)
 	}
-	tarPath := filepath.Join(top, "SOURCES", "demo-1.0.tar.bz2")
-	out, err := exec.Command("tar", "-tjf", tarPath).Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	list := string(out)
-	for _, want := range []string{"demo-1.0/demo.so", "demo-1.0/demo.h", "demo-1.0/rpm/demo.yaml"} {
-		if !strings.Contains(list, want) {
-			t.Fatalf("tarball missing %s:\n%s", want, list)
-		}
-	}
 	if _, err := os.Stat(filepath.Join(top, "rpm", "demo.yaml")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(top, "SOURCES", "demo.yaml")); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(top, "demo.so")); err == nil {
+		t.Fatal("should not copy project tree")
+	}
+	if _, err := os.Stat(filepath.Join(top, "SOURCES", "demo-1.0.tar.bz2")); err == nil {
+		t.Fatal("should not pack Source0 tarball")
 	}
 }
 
@@ -192,17 +179,19 @@ func TestPrepareStageSource(t *testing.T) {
 	if err := os.WriteFile(yamlPath, []byte(yaml), 0644); err != nil {
 		t.Fatal(err)
 	}
-	top, _, cleanup, err := prepareStage(dir, yamlPath, yaml, "srcpkg", "2")
+	top, _, cleanup, err := prepareStage(yamlPath, yaml, "srcpkg", "2")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cleanup()
-	out, err := exec.Command("tar", "-tjf", filepath.Join(top, "SOURCES", "srcpkg-2.tar.bz2")).Output()
-	if err != nil {
+	if _, err := os.Stat(filepath.Join(top, "rpm", "srcpkg.yaml")); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(out), "srcpkg-2/main.c") {
-		t.Fatalf("missing source:\n%s", out)
+	if _, err := os.Stat(filepath.Join(top, "main.c")); err == nil {
+		t.Fatal("should not copy project tree")
+	}
+	if _, err := os.Stat(filepath.Join(top, "SOURCES", "srcpkg-2.tar.bz2")); err == nil {
+		t.Fatal("should not pack Source0 tarball")
 	}
 }
 
@@ -222,14 +211,16 @@ func TestDockerArgs(t *testing.T) {
 		}
 	}
 
-	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/top", "/script.sh", "/out")
+	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out")
 	joined = strings.Join(run, " ")
 	for _, want := range []string{
 		"run --rm",
 		"--label sfosbuild=1",
 		"--platform linux/386",
 		"-e SFOS_ARCH=i486",
-		"/top:/build",
+		"/proj:/build",
+		"/top:/rpmbuild",
+		"-w /build",
 		"/script.sh:/usr/bin/sfos-rpmbuild.sh:ro",
 		"/out:/out",
 		"sfosbuild:5.1.0.11-i486 sh /usr/bin/sfos-rpmbuild.sh",
@@ -241,10 +232,20 @@ func TestDockerArgs(t *testing.T) {
 }
 
 func TestImageTag(t *testing.T) {
-	if got := imageTag("sfosbuild", "5.1.0.11", "aarch64"); got != "sfosbuild:5.1.0.11-aarch64" {
+	root := "/home/user/work/ReverseGearHead"
+	if got := imageRepo("sfosbuild", root); got != "sfosbuild_reversegearhead" {
 		t.Fatal(got)
 	}
-	if got := imageBuildTag("sfosbuild", "5.1.0.11", "aarch64", "abc123"); got != "sfosbuild:5.1.0.11-aarch64-abc123" {
+	if got := imageTag("sfosbuild", root, "5.1.0.11", "aarch64"); got != "sfosbuild_reversegearhead:5.1.0.11-aarch64" {
+		t.Fatal(got)
+	}
+	if got := imageBuildTag("sfosbuild", root, "5.1.0.11", "aarch64", "abc123"); got != "sfosbuild_reversegearhead:5.1.0.11-aarch64-abc123" {
+		t.Fatal(got)
+	}
+	if got := sanitizeImageName("My Project!!"); got != "my-project" {
+		t.Fatal(got)
+	}
+	if got := sanitizeImageName("..."); got != "workspace" {
 		t.Fatal(got)
 	}
 }
@@ -259,12 +260,6 @@ func TestBuildDepsHash(t *testing.T) {
 	h3 := buildDepsHash(meta, "2.0")
 	if h2 != h3 {
 		t.Fatalf("hash unstable: %q %q", h2, h3)
-	}
-}
-
-func TestTarFlag(t *testing.T) {
-	if tarFlag("a.tar.bz2") != "-cjf" || tarFlag("a.tar.gz") != "-czf" {
-		t.Fatal("tar flags")
 	}
 }
 
@@ -468,6 +463,7 @@ func TestUsage(t *testing.T) {
 		"-w $PWD",
 		"sfosbuild build",
 		"sfosbuild deploy",
+		"<prefix>_<workspace>",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("help missing %q", want)

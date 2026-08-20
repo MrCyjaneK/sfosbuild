@@ -3,7 +3,8 @@
 set -eu
 
 SFOS_ARCH="${SFOS_ARCH:-aarch64}"
-TOP=/build
+SRC=/build
+TOP=/rpmbuild
 OUT=/out
 
 case "$SFOS_ARCH" in
@@ -27,12 +28,19 @@ if [ -f "$yaml" ]; then
 	base=$(basename "$yaml" .yaml)
 	specify -N -n -o "$TOP/SPECS/${base}.spec" "$yaml"
 fi
+if [ -d "$SRC/rpm" ]; then
+	SOURCEDIR="$SRC/rpm"
+else
+	SOURCEDIR="$SRC"
+fi
 
 spec=$(echo "$TOP"/SPECS/*.spec)
 test -f "$spec"
 
-rpmbuild -ba \
+cd "$SRC"
+rpmbuild --build-in-place -bb \
 	--define "_topdir ${TOP}" \
+	--define "_sourcedir ${SOURCEDIR}" \
 	--define "_missing_build_ids_terminate_build 0" \
 	--define "certs_version ${CERTS_VERSION:-unknown}" \
 	--target "$RPM_TARGET" \
