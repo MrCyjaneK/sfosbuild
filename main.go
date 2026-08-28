@@ -175,7 +175,9 @@ Workspace:
   Walks up from the current directory looking for .sfosbuild/. That directory
   is $wd (the workspace root). If it is not found, sfosbuild exits. Every
   docker build and run is done in that workspace: image hooks come from
-  $wd/.sfosbuild/image/, and shell mounts $wd at the same path.
+  $wd/.sfosbuild/image/, and shell mounts $wd at the same path. Container
+  /root is bound to ~/.cache/sfosbuild/<version>/<arch>/m_root on every
+  docker run (build and shell).
 
   .sfosbuild/image/*.sh
       Run during SDK image build, in sorted order, after the target is
@@ -185,7 +187,7 @@ Workspace:
 Commands:
   build (default)  Package a project with specify + rpmbuild
   deploy           ssh uname -m and /etc/os-release, build, copy RPM, install on device
-  shell            docker run -i -t -v $wd:$wd -w $PWD in the SDK image
+  shell            docker run -i -t -v $wd:$wd -v m_root:/root -w $PWD in the SDK image
                    No command -> interactive sh -i. Rebuilds the image if hooks changed.
 
 Examples:
@@ -424,13 +426,17 @@ func runShell(args []string) error {
 		return err
 	}
 	tag := imageTag(cfg.ImagePrefix, cfg.Root, cfg.Version, arch)
-	dargs := dockerShellArgs(tag, archPlatform[arch], arch, cfg.Root, cfg.WorkDir, cmd, len(cmd) == 0)
+	merRoot, err := ensureMerRoot(cfg.Version, arch)
+	if err != nil {
+		return err
+	}
+	dargs := dockerShellArgs(tag, archPlatform[arch], arch, cfg.Root, cfg.WorkDir, merRoot, cmd, len(cmd) == 0)
 	c := dockerCmd(dargs...)
 	c.Stdin = os.Stdin
 	return runCmd(c)
 }
 
-func dockerShellArgs(tag, platform, arch, wd, workdir string, cmd []string, tty bool) []string {
+func dockerShellArgs(tag, platform, arch, wd, workdir, merRoot string, cmd []string, tty bool) []string {
 	args := []string{"run", "--rm", "-i"}
 	if tty {
 		args = append(args, "-t")
@@ -440,6 +446,7 @@ func dockerShellArgs(tag, platform, arch, wd, workdir string, cmd []string, tty 
 		"--platform", platform,
 		"-e", "SFOS_ARCH="+arch,
 		"-v", wd+":"+wd,
+		"-v", merRoot+":/root",
 		"-w", workdir,
 		tag,
 	)
@@ -817,14 +824,18 @@ func buildArch(cfg *config, arch, pkgPath, meta, name, version, out string) erro
 	if err != nil {
 		return err
 	}
-	args := dockerRunArgs(tag, archPlatform[arch], arch, cfg.Project, topdir, script, out)
+	merRoot, err := ensureMerRoot(cfg.Version, arch)
+	if err != nil {
+		return err
+	}
+	args := dockerRunArgs(tag, archPlatform[arch], arch, cfg.Project, topdir, script, out, merRoot)
 	if err := runCmd(dockerCmd(args...)); err != nil {
 		return fmt.Errorf("docker run: %w", err)
 	}
 	return nil
 }
 
-func dockerRunArgs(tag, platform, arch, project, topdir, script, out string) []string {
+func dockerRunArgs(tag, platform, arch, project, topdir, script, out, merRoot string) []string {
 	args := []string{
 		"run", "--rm",
 		"--label", dockerRunLabel,
@@ -837,6 +848,7 @@ func dockerRunArgs(tag, platform, arch, project, topdir, script, out string) []s
 		"-w", "/build",
 		"-v", script + ":/usr/bin/sfos-rpmbuild.sh:ro",
 		"-v", out + ":/out",
+		"-v", merRoot + ":/root",
 	}
 	if v := os.Getenv("CERTS_VERSION"); v != "" {
 		args = append(args, "-e", "CERTS_VERSION="+v)
@@ -850,6 +862,29 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func cacheDir() string {
+	if v := os.Getenv("XDG_CACHE_HOME"); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(".", ".cache")
+	}
+	return filepath.Join(home, ".cache")
+}
+
+func merRootDir(version, arch string) string {
+	return filepath.Join(cacheDir(), "sfosbuild", version, arch, "m_root")
+}
+
+func ensureMerRoot(version, arch string) (string, error) {
+	dir := merRootDir(version, arch)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", err
+	}
+	return dir, nil
 }
 
 func remoteArch(userHost string) (string, error) {

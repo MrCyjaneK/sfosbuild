@@ -211,7 +211,7 @@ func TestDockerArgs(t *testing.T) {
 		}
 	}
 
-	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out")
+	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root")
 	joined = strings.Join(run, " ")
 	for _, want := range []string{
 		"run --rm",
@@ -223,6 +223,7 @@ func TestDockerArgs(t *testing.T) {
 		"-w /build",
 		"/script.sh:/usr/bin/sfos-rpmbuild.sh:ro",
 		"/out:/out",
+		"/cache/m_root:/root",
 		"sfosbuild:5.1.0.11-i486 sh /usr/bin/sfos-rpmbuild.sh",
 	} {
 		if !strings.Contains(joined, want) {
@@ -356,15 +357,44 @@ func TestParseShellArgs(t *testing.T) {
 	}
 }
 
+func TestMerRootDir(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", "/tmp/xdg-cache")
+	got := merRootDir("5.1.0.11", "i486")
+	want := filepath.Join("/tmp/xdg-cache", "sfosbuild", "5.1.0.11", "i486", "m_root")
+	if got != want {
+		t.Fatalf("got %s want %s", got, want)
+	}
+	t.Setenv("XDG_CACHE_HOME", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	got = merRootDir("5.1.0.11", "aarch64")
+	want = filepath.Join(home, ".cache", "sfosbuild", "5.1.0.11", "aarch64", "m_root")
+	if got != want {
+		t.Fatalf("HOME cache: got %s want %s", got, want)
+	}
+	dir, err := ensureMerRoot("5.1.0.11", "aarch64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir != want {
+		t.Fatalf("ensure: %s want %s", dir, want)
+	}
+	st, err := os.Stat(dir)
+	if err != nil || !st.IsDir() {
+		t.Fatalf("mkdir: %v %v", st, err)
+	}
+}
+
 func TestDockerShellArgs(t *testing.T) {
 	wd := "/home/user/work/reversegearhead"
 	pwd := wd + "/libreversegearhead"
-	args := dockerShellArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", wd, pwd, []string{"uname", "-m"}, false)
+	args := dockerShellArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", wd, pwd, "/cache/m_root", []string{"uname", "-m"}, false)
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"run --rm",
 		"--platform linux/386",
 		"-v " + wd + ":" + wd,
+		"-v /cache/m_root:/root",
 		"-w " + pwd,
 		"sfosbuild:5.1.0.11-i486 uname -m",
 	} {
@@ -378,7 +408,7 @@ func TestDockerShellArgs(t *testing.T) {
 	if !strings.Contains(joined, " -i ") && !strings.Contains(joined, "run --rm -i") {
 		t.Fatalf("stdin should be attached: %s", joined)
 	}
-	args = dockerShellArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", wd, pwd, nil, true)
+	args = dockerShellArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", wd, pwd, "/cache/m_root", nil, true)
 	joined = strings.Join(args, " ")
 	if !strings.Contains(joined, " -t") || !strings.HasSuffix(joined, " sh -i") {
 		t.Fatalf("interactive sh: %s", joined)
@@ -460,6 +490,7 @@ func TestUsage(t *testing.T) {
 		".sfosbuild/",
 		".sfosbuild/image/*.sh",
 		"-v $wd:$wd",
+		"-v m_root:/root",
 		"-w $PWD",
 		"sfosbuild build",
 		"sfosbuild deploy",
