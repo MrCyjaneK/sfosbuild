@@ -443,6 +443,15 @@ SAILFISH_BUILD=11
 	if got := osReleaseField(release, "VERSION_ID"); got != "5.1.0.11" {
 		t.Fatalf("VERSION_ID=%q", got)
 	}
+	if got := versionFromProbe("4.5.0.19\n", release); got != "4.5.0.19" {
+		t.Fatalf("override=%q", got)
+	}
+	if got := versionFromProbe("not-a-version\n", release); got != "5.1.0.11" {
+		t.Fatalf("invalid override=%q", got)
+	}
+	if got := versionFromProbe("", release); got != "5.1.0.11" {
+		t.Fatalf("no override=%q", got)
+	}
 }
 
 func TestFindMainRPM(t *testing.T) {
@@ -494,6 +503,7 @@ func TestUsage(t *testing.T) {
 		"-w $PWD",
 		"sfosbuild build",
 		"sfosbuild deploy",
+		"device ~/.sfosbuild-os-version",
 		"<prefix>_<workspace>",
 	} {
 		if !strings.Contains(s, want) {

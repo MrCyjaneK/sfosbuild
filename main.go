@@ -187,6 +187,7 @@ Workspace:
 Commands:
   build (default)  Package a project with specify + rpmbuild
   deploy           ssh uname -m and /etc/os-release, build, copy RPM, install on device
+                   device ~/.sfosbuild-os-version (x.x.x.x) overrides the probed OS version
   shell            docker run -i -t -v $wd:$wd -v m_root:/root -w $PWD in the SDK image
                    No command -> interactive sh -i. Rebuilds the image if hooks changed.
 
@@ -895,12 +896,41 @@ func remoteArch(userHost string) (string, error) {
 	return normalizeArch(strings.TrimSpace(string(out)))
 }
 
+func validOSVersion(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return false
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func versionFromProbe(override, osRelease string) string {
+	if v := strings.TrimSpace(override); validOSVersion(v) {
+		return v
+	}
+	return osReleaseField(osRelease, "VERSION_ID")
+}
+
 func remoteVersion(userHost string) (string, error) {
+	override, _ := exec.Command("ssh", userHost, `cat "$HOME/.sfosbuild-os-version"`).Output()
+	if v := versionFromProbe(string(override), ""); v != "" {
+		return v, nil
+	}
 	out, err := exec.Command("ssh", userHost, "cat", "/etc/os-release").Output()
 	if err != nil {
 		return "", err
 	}
-	v := osReleaseField(string(out), "VERSION_ID")
+	v := versionFromProbe("", string(out))
 	if v == "" {
 		return "", fmt.Errorf("no VERSION_ID in /etc/os-release")
 	}
