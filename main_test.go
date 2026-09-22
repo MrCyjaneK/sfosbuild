@@ -211,13 +211,14 @@ func TestDockerArgs(t *testing.T) {
 		}
 	}
 
-	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root")
+	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root", "/home/user")
 	joined = strings.Join(run, " ")
 	for _, want := range []string{
 		"run --rm",
 		"--label sfosbuild=1",
 		"--platform linux/386",
 		"-e SFOS_ARCH=i486",
+		"-v /home/user:/home/user:ro",
 		"/proj:/build",
 		"/top:/rpmbuild",
 		"-w /build",
@@ -388,11 +389,12 @@ func TestMerRootDir(t *testing.T) {
 func TestDockerShellArgs(t *testing.T) {
 	wd := "/home/user/work/reversegearhead"
 	pwd := wd + "/libreversegearhead"
-	args := dockerShellArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", wd, pwd, "/cache/m_root", []string{"uname", "-m"}, false)
+	args := dockerShellArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", wd, pwd, "/cache/m_root", "/home/user", []string{"uname", "-m"}, false)
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"run --rm",
 		"--platform linux/386",
+		"-v /home/user:/home/user:ro",
 		"-v " + wd + ":" + wd,
 		"-v /cache/m_root:/root",
 		"-w " + pwd,
@@ -408,7 +410,7 @@ func TestDockerShellArgs(t *testing.T) {
 	if !strings.Contains(joined, " -i ") && !strings.Contains(joined, "run --rm -i") {
 		t.Fatalf("stdin should be attached: %s", joined)
 	}
-	args = dockerShellArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", wd, pwd, "/cache/m_root", nil, true)
+	args = dockerShellArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", wd, pwd, "/cache/m_root", "/home/user", nil, true)
 	joined = strings.Join(args, " ")
 	if !strings.Contains(joined, " -t") || !strings.HasSuffix(joined, " sh -i") {
 		t.Fatalf("interactive sh: %s", joined)
