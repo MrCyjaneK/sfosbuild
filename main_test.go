@@ -1,7 +1,10 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/bzip2"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -150,7 +153,7 @@ Sources:
 		t.Fatal(err)
 	}
 
-	top, script, cleanup, err := prepareStage(yamlPath, yaml, "demo", "1.0")
+	top, script, cleanup, err := prepareStage(yamlPath, yaml, "demo", "1.0", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +182,7 @@ func TestPrepareStageSource(t *testing.T) {
 	if err := os.WriteFile(yamlPath, []byte(yaml), 0644); err != nil {
 		t.Fatal(err)
 	}
-	top, _, cleanup, err := prepareStage(yamlPath, yaml, "srcpkg", "2")
+	top, _, cleanup, err := prepareStage(yamlPath, yaml, "srcpkg", "2", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,6 +195,64 @@ func TestPrepareStageSource(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(top, "SOURCES", "srcpkg-2.tar.bz2")); err == nil {
 		t.Fatal("should not pack Source0 tarball")
+	}
+}
+
+func TestGitArchive(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", args, out)
+		}
+	}
+	run("init")
+	if err := os.WriteFile(filepath.Join(dir, "main.c"), []byte("int main(){return 0;}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("Makefile\nharbour-speedtest\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "main.c", ".gitignore")
+	run("commit", "-m", "init")
+	if err := os.WriteFile(filepath.Join(dir, "Makefile"), []byte("all:\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "harbour-speedtest"), []byte("bin"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tarPath, cleanup, err := writeGitArchive(dir, "demo", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	f, err := os.Open(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	tr := tar.NewReader(bzip2.NewReader(f))
+	names := map[string]bool{}
+	for {
+		h, err := tr.Next()
+		if err != nil {
+			break
+		}
+		names[h.Name] = true
+	}
+	if !names["demo-1.0/main.c"] {
+		t.Fatalf("missing source: %v", names)
+	}
+	if names["demo-1.0/Makefile"] || names["demo-1.0/harbour-speedtest"] {
+		t.Fatalf("archive includes build output: %v", names)
 	}
 }
 
@@ -211,7 +272,7 @@ func TestDockerArgs(t *testing.T) {
 		}
 	}
 
-	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root", "/home/user")
+	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root", "/home/user", true)
 	joined = strings.Join(run, " ")
 	for _, want := range []string{
 		"run --rm",
@@ -219,6 +280,7 @@ func TestDockerArgs(t *testing.T) {
 		"--platform linux/386",
 		"-e SFOS_ARCH=i486",
 		"-v /home/user:/home/user:ro",
+		"-e SFOS_INPLACE=1",
 		"/proj:/build",
 		"/top:/rpmbuild",
 		"-w /build",
@@ -230,6 +292,14 @@ func TestDockerArgs(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing %q in %s", want, joined)
 		}
+	}
+
+	clean := strings.Join(dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root", false), " ")
+	if strings.Contains(clean, "/proj:/build") || strings.Contains(clean, "SFOS_INPLACE") {
+		t.Fatalf("clean build should not mount the project: %s", clean)
+	}
+	if !strings.Contains(clean, "-w /rpmbuild") {
+		t.Fatalf("missing rpmbuild workdir in %s", clean)
 	}
 }
 

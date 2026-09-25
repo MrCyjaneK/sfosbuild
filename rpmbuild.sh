@@ -28,17 +28,23 @@ if [ -f "$yaml" ]; then
 	base=$(basename "$yaml" .yaml)
 	specify -N -n -o "$TOP/SPECS/${base}.spec" "$yaml"
 fi
-if [ -d "$SRC/rpm" ]; then
-	SOURCEDIR="$SRC/rpm"
-else
-	SOURCEDIR="$SRC"
-fi
-
 spec=$(echo "$TOP"/SPECS/*.spec)
 test -f "$spec"
 
-cd "$SRC"
-rpmbuild --build-in-place -bb \
+inplace=
+if [ "${SFOS_INPLACE:-}" = 1 ]; then
+	inplace=--build-in-place
+	if [ -d "$SRC/rpm" ]; then
+		SOURCEDIR="$SRC/rpm"
+	else
+		SOURCEDIR="$SRC"
+	fi
+	cd "$SRC"
+else
+	SOURCEDIR="$TOP/SOURCES"
+fi
+
+rpmbuild $inplace -bb \
 	--define "_topdir ${TOP}" \
 	--define "_sourcedir ${SOURCEDIR}" \
 	--define "_missing_build_ids_terminate_build 0" \

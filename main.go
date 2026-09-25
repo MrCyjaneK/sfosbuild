@@ -42,6 +42,7 @@ type config struct {
 	Project     string
 	Output      string
 	Rebuild     bool
+	InPlace     bool // deploy builds the working tree; build packages HEAD
 	ImagePrefix string
 	Root        string // $wd: directory that contains .sfosbuild/
 	WorkDir     string // host cwd, used as docker -w
@@ -107,9 +108,20 @@ func runBuild(cfg *config) error {
 		return err
 	}
 
+	var sourceTar string
+	if !cfg.InPlace {
+		tarPath, tarCleanup, err := writeGitArchive(cfg.Project, name, version)
+		if err != nil {
+			return err
+		}
+		defer tarCleanup()
+		sourceTar = tarPath
+		log.Printf("source %s", filepath.Base(sourceTar))
+	}
+
 	for _, arch := range cfg.Arches {
 		log.Printf("%s %s %s", cfg.Version, arch, name)
-		if err := buildArch(cfg, arch, pkgPath, string(meta), name, version, outAbs); err != nil {
+		if err := buildArch(cfg, arch, pkgPath, string(meta), name, version, outAbs, sourceTar); err != nil {
 			return fmt.Errorf("%s: %w", arch, err)
 		}
 	}
@@ -136,6 +148,7 @@ func runDeploy(args []string) error {
 	log.Printf("%s is %s %s", userHost, arch, version)
 	cfg.Version = version
 	cfg.Arches = []string{arch}
+	cfg.InPlace = true
 	if err := runBuild(cfg); err != nil {
 		return err
 	}
@@ -210,8 +223,9 @@ Architectures: aarch64, armv7hl (armv7a), i486, all
   shell takes a single arch (not all).
 
 The project needs rpm/*.yaml (spectacle). specify runs in the SDK image
-to generate the spec. rpmbuild --build-in-place runs in the project
-directory (no Source0 tarball).
+to generate the spec. build packages the git HEAD tree as Source0 and
+runs a clean rpmbuild. deploy uses rpmbuild --build-in-place on the
+working tree.
 Images are tagged <prefix>_<workspace>:<version>-<arch>, where
 <workspace> is the directory that contains .sfosbuild/.
 `)
@@ -606,7 +620,77 @@ func cp(src, dst string) error {
 	return os.WriteFile(dst, data, 0644)
 }
 
-func prepareStage(pkgPath, meta, name, version string) (topdir, script string, cleanup func(), err error) {
+func writeGitArchive(project, name, version string) (path string, cleanup func(), err error) {
+	top, err := gitOutput(project, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", nil, fmt.Errorf("%s is not a git repository (%w)", project, err)
+	}
+	prefix, err := gitOutput(project, "rev-parse", "--show-prefix")
+	if err != nil {
+		return "", nil, err
+	}
+	if dirty, err := gitOutput(project, "status", "--porcelain"); err == nil && strings.TrimSpace(dirty) != "" {
+		log.Printf("working tree has uncommitted changes; build uses HEAD")
+	}
+	work, err := os.MkdirTemp("", "sfosbuild-src-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup = func() { os.RemoveAll(work) }
+	path = filepath.Join(work, name+"-"+version+".tar.bz2")
+	tree := "HEAD"
+	if prefix != "" {
+		tree = "HEAD:" + strings.TrimSuffix(prefix, "/")
+	}
+	out, err := os.Create(path)
+	if err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	git := exec.Command("git", "-C", top, "archive", "--format=tar",
+		"--prefix", name+"-"+version+"/", tree)
+	git.Stderr = os.Stderr
+	stdout, err := git.StdoutPipe()
+	if err != nil {
+		out.Close()
+		cleanup()
+		return "", nil, err
+	}
+	if err := git.Start(); err != nil {
+		out.Close()
+		cleanup()
+		return "", nil, err
+	}
+	bz := exec.Command("bzip2", "-c")
+	bz.Stdin = stdout
+	bz.Stdout = out
+	bz.Stderr = os.Stderr
+	bzErr := bz.Run()
+	gitErr := git.Wait()
+	closeErr := out.Close()
+	if gitErr != nil || bzErr != nil || closeErr != nil {
+		cleanup()
+		if gitErr != nil {
+			return "", nil, fmt.Errorf("git archive: %w", gitErr)
+		}
+		if bzErr != nil {
+			return "", nil, fmt.Errorf("bzip2: %w", bzErr)
+		}
+		return "", nil, closeErr
+	}
+	return path, cleanup, nil
+}
+
+func gitOutput(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func prepareStage(pkgPath, meta, name, version, sourceTar string) (topdir, script string, cleanup func(), err error) {
 	work, err := os.MkdirTemp("", "sfosbuild-")
 	if err != nil {
 		return "", "", nil, err
@@ -653,6 +737,13 @@ func prepareStage(pkgPath, meta, name, version string) (topdir, script string, c
 	if err := os.WriteFile(script, scriptBytes, 0755); err != nil {
 		cleanup()
 		return "", "", nil, err
+	}
+	if sourceTar != "" {
+		dst := filepath.Join(topdir, "SOURCES", filepath.Base(sourceTar))
+		if err := cp(sourceTar, dst); err != nil {
+			cleanup()
+			return "", "", nil, err
+		}
 	}
 	return topdir, script, cleanup, nil
 }
@@ -818,8 +909,8 @@ LABEL sfosbuild.build-deps-hash=${SFOSBUILD_DEPS_HASH}
 	return runCmd(dockerCmd(args...))
 }
 
-func buildArch(cfg *config, arch, pkgPath, meta, name, version, out string) error {
-	topdir, script, cleanup, err := prepareStage(pkgPath, meta, name, version)
+func buildArch(cfg *config, arch, pkgPath, meta, name, version, out, sourceTar string) error {
+	topdir, script, cleanup, err := prepareStage(pkgPath, meta, name, version, sourceTar)
 	if err != nil {
 		return err
 	}
@@ -839,14 +930,15 @@ func buildArch(cfg *config, arch, pkgPath, meta, name, version, out string) erro
 	if err != nil {
 		return err
 	}
-	args := dockerRunArgs(tag, archPlatform[arch], arch, cfg.Project, topdir, script, out, merRoot, home)
+	args := dockerRunArgs(tag, archPlatform[arch], arch, cfg.Project, topdir, script, out, merRoot, home, cfg.InPlace)
 	if err := runCmd(dockerCmd(args...)); err != nil {
 		return fmt.Errorf("docker run: %w", err)
 	}
 	return nil
 }
 
-func dockerRunArgs(tag, platform, arch, project, topdir, script, out, merRoot, home string) []string {
+func dockerRunArgs(tag, platform, arch, project, topdir, script, out, merRoot, home string, inPlace bool) []string {
+	workdir := "/rpmbuild"
 	args := []string{
 		"run", "--rm",
 		"--label", dockerRunLabel,
@@ -862,6 +954,20 @@ func dockerRunArgs(tag, platform, arch, project, topdir, script, out, merRoot, h
 		"-v", out + ":/out",
 		"-v", merRoot + ":/root",
 	}
+	if inPlace {
+		workdir = "/build"
+		args = append(args,
+			"-e", "SFOS_INPLACE=1",
+			"-v", project+":/build",
+		)
+	}
+	args = append(args,
+		"-v", topdir+":/rpmbuild",
+		"-w", workdir,
+		"-v", script+":/usr/bin/sfos-rpmbuild.sh:ro",
+		"-v", out+":/out",
+		"-v", merRoot+":/root",
+	)
 	if v := os.Getenv("CERTS_VERSION"); v != "" {
 		args = append(args, "-e", "CERTS_VERSION="+v)
 	}
