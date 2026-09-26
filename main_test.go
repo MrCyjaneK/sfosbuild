@@ -81,6 +81,14 @@ func TestParseArgs(t *testing.T) {
 		t.Fatalf("%+v", cfg)
 	}
 
+	cfg, err = parseArgs([]string{"--in-place", "5.1.0.11", "aarch64", dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.InPlace {
+		t.Fatal("expected in-place")
+	}
+
 	cfg, err = parseArgs([]string{"--help"})
 	if err != nil || cfg != nil {
 		t.Fatalf("help: %v %v", cfg, err)
@@ -294,7 +302,7 @@ func TestDockerArgs(t *testing.T) {
 		}
 	}
 
-	clean := strings.Join(dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root", false), " ")
+	clean := strings.Join(dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root", "/home/user", false), " ")
 	if strings.Contains(clean, "/proj:/build") || strings.Contains(clean, "SFOS_INPLACE") {
 		t.Fatalf("clean build should not mount the project: %s", clean)
 	}
@@ -575,6 +583,7 @@ func TestUsage(t *testing.T) {
 		"-w $PWD",
 		"sfosbuild build",
 		"sfosbuild deploy",
+		"--in-place",
 		"device ~/.sfosbuild-os-version",
 		"<prefix>_<workspace>",
 	} {

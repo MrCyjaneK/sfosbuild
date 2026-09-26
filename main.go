@@ -42,7 +42,7 @@ type config struct {
 	Project     string
 	Output      string
 	Rebuild     bool
-	InPlace     bool // deploy builds the working tree; build packages HEAD
+	InPlace     bool // working tree via rpmbuild --build-in-place; otherwise git archive of HEAD
 	ImagePrefix string
 	Root        string // $wd: directory that contains .sfosbuild/
 	WorkDir     string // host cwd, used as docker -w
@@ -215,6 +215,7 @@ Examples:
 
 Options:
   -o, --output DIR     RPM output directory (default: <project>/rpms)
+  --in-place           rpmbuild --build-in-place on the working tree
   --rebuild            rebuild SDK images even if they exist
   --image-prefix NAME  docker image prefix (default: sfosbuild)
   -h, --help           show this help
@@ -224,8 +225,9 @@ Architectures: aarch64, armv7hl (armv7a), i486, all
 
 The project needs rpm/*.yaml (spectacle). specify runs in the SDK image
 to generate the spec. build packages the git HEAD tree as Source0 and
-runs a clean rpmbuild. deploy uses rpmbuild --build-in-place on the
-working tree.
+runs a clean rpmbuild. --in-place and deploy use rpmbuild --build-in-place
+on the working tree. Drop the previous arch's build tree first (make clean
+and make distclean) so that cache is not packaged.
 Images are tagged <prefix>_<workspace>:<version>-<arch>, where
 <workspace> is the directory that contains .sfosbuild/.
 `)
@@ -243,6 +245,8 @@ func parseFlags(args []string) (*config, []string, error) {
 		case a == "-h" || a == "--help":
 			usage(os.Stdout)
 			return nil, nil, nil
+		case a == "--in-place" || a == "-in-place":
+			cfg.InPlace = true
 		case a == "--rebuild":
 			cfg.Rebuild = true
 		case a == "-o" || a == "--output":
@@ -947,12 +951,6 @@ func dockerRunArgs(tag, platform, arch, project, topdir, script, out, merRoot, h
 		"-e", "HOST_UID=" + strconv.Itoa(os.Getuid()),
 		"-e", "HOST_GID=" + strconv.Itoa(os.Getgid()),
 		"-v", home + ":" + home + ":ro",
-		"-v", project + ":/build",
-		"-v", topdir + ":/rpmbuild",
-		"-w", "/build",
-		"-v", script + ":/usr/bin/sfos-rpmbuild.sh:ro",
-		"-v", out + ":/out",
-		"-v", merRoot + ":/root",
 	}
 	if inPlace {
 		workdir = "/build"
