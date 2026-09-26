@@ -10,8 +10,8 @@ ssu dr customer-jolla 2>/dev/null || true
 ssu dr apps 2>/dev/null || true
 ssu dr adaptation-common 2>/dev/null || true
 ssu dr hotfixes 2>/dev/null || true
-ssu dr jolla 2>/dev/null || true
 ssu dr sdk 2>/dev/null || true
+ssu ur
 rm -f /etc/zypp/repos.d/ssu_*.repo
 
 zypper --non-interactive rr jolla 2>/dev/null || true

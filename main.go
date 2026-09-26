@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"embed"
@@ -42,7 +44,7 @@ type config struct {
 	Project     string
 	Output      string
 	Rebuild     bool
-	InPlace     bool // working tree via rpmbuild --build-in-place; otherwise git archive of HEAD
+	InPlace     bool // working tree via rpmbuild --build-in-place; otherwise git archive of HEAD and local submodules
 	ImagePrefix string
 	Root        string // $wd: directory that contains .sfosbuild/
 	WorkDir     string // host cwd, used as docker -w
@@ -224,8 +226,9 @@ Architectures: aarch64, armv7hl (armv7a), i486, all
   shell takes a single arch (not all).
 
 The project needs rpm/*.yaml (spectacle). specify runs in the SDK image
-to generate the spec. build packages the git HEAD tree as Source0 and
-runs a clean rpmbuild. --in-place and deploy use rpmbuild --build-in-place
+to generate the spec. build packages the git HEAD tree as Source0,
+including submodules already present in the local repository, and runs a
+clean rpmbuild. --in-place and deploy use rpmbuild --build-in-place
 on the working tree. Drop the previous arch's build tree first (make clean
 and make distclean) so that cache is not packaged.
 Images are tagged <prefix>_<workspace>:<version>-<arch>, where
@@ -641,57 +644,267 @@ func writeGitArchive(project, name, version string) (path string, cleanup func()
 		return "", nil, err
 	}
 	cleanup = func() { os.RemoveAll(work) }
-	path = filepath.Join(work, name+"-"+version+".tar.bz2")
+	fail := func(err error) (string, func(), error) {
+		cleanup()
+		return "", nil, err
+	}
 	tree := "HEAD"
 	if prefix != "" {
 		tree = "HEAD:" + strings.TrimSuffix(prefix, "/")
 	}
-	out, err := os.Create(path)
+	tarPath := filepath.Join(work, name+"-"+version+".tar")
+	tf, err := os.Create(tarPath)
 	if err != nil {
-		cleanup()
-		return "", nil, err
+		return fail(err)
 	}
-	git := exec.Command("git", "-C", top, "archive", "--format=tar",
-		"--prefix", name+"-"+version+"/", tree)
-	git.Stderr = os.Stderr
-	stdout, err := git.StdoutPipe()
-	if err != nil {
-		out.Close()
-		cleanup()
-		return "", nil, err
+	tw := tar.NewWriter(tf)
+	archErr := archiveTree(tw, top, "", tree, name+"-"+version+"/", map[string]bool{})
+	closeErr := tw.Close()
+	fileErr := tf.Close()
+	if archErr != nil {
+		return fail(archErr)
 	}
-	if err := git.Start(); err != nil {
-		out.Close()
-		cleanup()
-		return "", nil, err
+	if closeErr != nil {
+		return fail(closeErr)
 	}
-	bz := exec.Command("bzip2", "-c")
-	bz.Stdin = stdout
-	bz.Stdout = out
-	bz.Stderr = os.Stderr
-	bzErr := bz.Run()
-	gitErr := git.Wait()
-	closeErr := out.Close()
-	if gitErr != nil || bzErr != nil || closeErr != nil {
-		cleanup()
-		if gitErr != nil {
-			return "", nil, fmt.Errorf("git archive: %w", gitErr)
-		}
-		if bzErr != nil {
-			return "", nil, fmt.Errorf("bzip2: %w", bzErr)
-		}
-		return "", nil, closeErr
+	if fileErr != nil {
+		return fail(fileErr)
+	}
+	path = filepath.Join(work, name+"-"+version+".tar.bz2")
+	if err := bzip2File(tarPath, path); err != nil {
+		return fail(err)
 	}
 	return path, cleanup, nil
 }
 
-func gitOutput(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	out, err := cmd.Output()
+// archiveTree packs tree and any gitlinks it records. Submodule contents come
+// from the local module git dir (.git/modules/...). Nothing is fetched or
+// checked out.
+func archiveTree(tw *tar.Writer, workTree, gitDir, tree, prefix string, seen map[string]bool) error {
+	key := workTree + "\x00" + gitDir + "\x00" + tree
+	if seen[key] {
+		return fmt.Errorf("submodule cycle at %s", tree)
+	}
+	seen[key] = true
+	if err := copyGitArchive(tw, workTree, gitDir, tree, prefix); err != nil {
+		return err
+	}
+	return appendSubmodules(tw, workTree, gitDir, tree, prefix, seen)
+}
+
+func copyGitArchive(tw *tar.Writer, workTree, gitDir, tree, prefix string) error {
+	cmd := gitCmd(workTree, gitDir, "archive", "--format=tar", "--prefix", prefix, tree)
+	cmd.Stderr = os.Stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	copyErr := copyTar(tw, stdout)
+	waitErr := cmd.Wait()
+	if copyErr != nil {
+		return copyErr
+	}
+	if waitErr != nil {
+		return fmt.Errorf("git archive: %w", waitErr)
+	}
+	return nil
+}
+
+func copyTar(tw *tar.Writer, r io.Reader) error {
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if _, err := io.Copy(tw, tr); err != nil {
+			return err
+		}
+	}
+}
+
+type gitlink struct {
+	sha  string
+	path string
+}
+
+func appendSubmodules(tw *tar.Writer, workTree, gitDir, tree, prefix string, seen map[string]bool) error {
+	links, err := gitlinks(workTree, gitDir, tree)
+	if err != nil || len(links) == 0 {
+		return err
+	}
+	commit, subdir := tree, ""
+	if i := strings.Index(tree, ":"); i >= 0 {
+		commit, subdir = tree[:i], tree[i+1:]
+	}
+	names, err := submoduleNames(workTree, gitDir, commit)
+	if err != nil {
+		return err
+	}
+	for _, link := range links {
+		full := link.path
+		if subdir != "" {
+			full = subdir + "/" + link.path
+		}
+		name, ok := names[full]
+		if !ok {
+			return fmt.Errorf("gitlink %s has no .gitmodules entry", full)
+		}
+		subGit, err := submoduleGitDir(workTree, gitDir, name)
+		if err != nil {
+			return err
+		}
+		if _, err := gitOutputOpt("", subGit, "cat-file", "-e", link.sha+"^{commit}"); err != nil {
+			return fmt.Errorf("submodule %s commit %s is not present locally", full, link.sha)
+		}
+		log.Printf("submodule %s", full)
+		if err := archiveTree(tw, "", subGit, link.sha, prefix+link.path+"/", seen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func gitlinks(workTree, gitDir, tree string) ([]gitlink, error) {
+	out, err := gitOutputBytes(workTree, gitDir, "ls-tree", "-r", "-z", tree)
+	if err != nil {
+		return nil, err
+	}
+	var links []gitlink
+	for _, rec := range bytes.Split(out, []byte{0}) {
+		if len(rec) == 0 {
+			continue
+		}
+		tab := bytes.IndexByte(rec, '\t')
+		if tab < 0 {
+			continue
+		}
+		fields := strings.Fields(string(rec[:tab]))
+		if len(fields) < 3 || fields[0] != "160000" {
+			continue
+		}
+		links = append(links, gitlink{sha: fields[2], path: string(rec[tab+1:])})
+	}
+	return links, nil
+}
+
+func submoduleNames(workTree, gitDir, commit string) (map[string]string, error) {
+	if _, err := gitOutputOpt(workTree, gitDir, "cat-file", "-e", commit+":.gitmodules"); err != nil {
+		return map[string]string{}, nil
+	}
+	out, err := gitOutputBytes(workTree, gitDir, "show", commit+":.gitmodules")
+	if err != nil {
+		return nil, err
+	}
+	return parseGitmodules(string(out)), nil
+}
+
+func parseGitmodules(data string) map[string]string {
+	pathToName := map[string]string{}
+	var name, path string
+	flush := func() {
+		if name != "" && path != "" {
+			pathToName[path] = name
+		}
+	}
+	for _, line := range strings.Split(data, "\n") {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, `[submodule "`) && strings.HasSuffix(trim, `"]`) {
+			flush()
+			name = trim[len(`[submodule "`) : len(trim)-2]
+			path = ""
+			continue
+		}
+		key, val, ok := strings.Cut(trim, "=")
+		if !ok || strings.TrimSpace(key) != "path" {
+			continue
+		}
+		path = strings.TrimSpace(val)
+	}
+	flush()
+	return pathToName
+}
+
+func submoduleGitDir(workTree, gitDir, name string) (string, error) {
+	out, err := gitOutputOpt(workTree, gitDir, "rev-parse", "--path-format=absolute", "--git-path", "modules/"+name)
+	if err == nil {
+		return out, nil
+	}
+	out, err = gitOutputOpt(workTree, gitDir, "rev-parse", "--git-path", "modules/"+name)
+	if err != nil {
+		return "", err
+	}
+	if filepath.IsAbs(out) {
+		return out, nil
+	}
+	base := workTree
+	if base == "" {
+		var cwdErr error
+		base, cwdErr = os.Getwd()
+		if cwdErr != nil {
+			return "", cwdErr
+		}
+	}
+	return filepath.Join(base, out), nil
+}
+
+func bzip2File(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	cmd := exec.Command("bzip2", "-c")
+	cmd.Stdin = in
+	cmd.Stdout = out
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("bzip2: %w", err)
+	}
+	return nil
+}
+
+func gitCmd(workTree, gitDir string, args ...string) *exec.Cmd {
+	full := make([]string, 0, len(args)+4)
+	if gitDir != "" {
+		full = append(full, "--git-dir", gitDir)
+	}
+	if workTree != "" {
+		full = append(full, "-C", workTree)
+	}
+	full = append(full, args...)
+	return exec.Command("git", full...)
+}
+
+func gitOutputOpt(workTree, gitDir string, args ...string) (string, error) {
+	out, err := gitOutputBytes(workTree, gitDir, args...)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func gitOutputBytes(workTree, gitDir string, args ...string) ([]byte, error) {
+	cmd := gitCmd(workTree, gitDir, args...)
+	return cmd.Output()
+}
+
+func gitOutput(dir string, args ...string) (string, error) {
+	return gitOutputOpt(dir, "", args...)
 }
 
 func prepareStage(pkgPath, meta, name, version, sourceTar string) (topdir, script string, cleanup func(), err error) {

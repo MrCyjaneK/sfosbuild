@@ -2,7 +2,9 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/bzip2"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -262,6 +264,165 @@ func TestGitArchive(t *testing.T) {
 	if names["demo-1.0/Makefile"] || names["demo-1.0/harbour-speedtest"] {
 		t.Fatalf("archive includes build output: %v", names)
 	}
+}
+
+func TestGitArchiveSubmodules(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+	t.Setenv("GIT_CONFIG_VALUE_0", "always")
+
+	root := t.TempDir()
+	leaf := filepath.Join(root, "leaf")
+	mid := filepath.Join(root, "mid")
+	parent := filepath.Join(root, "parent")
+	git := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git -C %s %v: %s", dir, args, out)
+		}
+	}
+	out := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		b, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("git -C %s %v: %v", dir, args, err)
+		}
+		return strings.TrimSpace(string(b))
+	}
+	initRepo := func(dir string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		git(dir, "init", "-q")
+	}
+
+	initRepo(leaf)
+	if err := os.WriteFile(filepath.Join(leaf, "leaf.txt"), []byte("leaf\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git(leaf, "add", "leaf.txt")
+	git(leaf, "commit", "-qm", "leaf")
+
+	initRepo(mid)
+	if err := os.WriteFile(filepath.Join(mid, "mid.txt"), []byte("mid\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git(mid, "add", "mid.txt")
+	git(mid, "commit", "-qm", "mid")
+	git(mid, "submodule", "add", "--", leaf, "nested")
+	git(mid, "commit", "-qm", "add-nested")
+
+	initRepo(parent)
+	if err := os.WriteFile(filepath.Join(parent, "top.txt"), []byte("top\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git(parent, "add", "top.txt")
+	git(parent, "commit", "-qm", "top")
+	git(parent, "submodule", "add", "--", mid, "vendor")
+	git(parent, "submodule", "update", "--init", "--recursive")
+	git(parent, "commit", "-qm", "add-vendor")
+
+	// URLs in HEAD must not be reachable. Objects stay in .git/modules.
+	vendor := filepath.Join(parent, "vendor")
+	rewriteGitmodulesURL(t, filepath.Join(vendor, ".gitmodules"), leaf, "https://127.0.0.1:1/leaf.git")
+	git(vendor, "add", ".gitmodules")
+	git(vendor, "commit", "-qm", "dead-nested-url")
+	git(parent, "add", "vendor")
+	rewriteGitmodulesURL(t, filepath.Join(parent, ".gitmodules"), mid, "https://127.0.0.1:1/mid.git")
+	git(parent, "add", ".gitmodules")
+	git(parent, "commit", "-qm", "dead-urls")
+
+	if err := os.WriteFile(filepath.Join(parent, "dirty.txt"), []byte("dirty\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "vendor", "mid.txt"), []byte("dirty-mid\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	head := out(parent, "rev-parse", "HEAD")
+	status := out(parent, "status", "--porcelain")
+
+	tarPath, cleanup, err := writeGitArchive(parent, "demo", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	if got := out(parent, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("HEAD changed: %s -> %s", head, got)
+	}
+	if got := out(parent, "status", "--porcelain"); got != status {
+		t.Fatalf("status changed:\n%s\n->\n%s", status, got)
+	}
+
+	files := tarFiles(t, tarPath)
+	if files["demo-1.0/top.txt"] != "top\n" {
+		t.Fatalf("top.txt: %q", files["demo-1.0/top.txt"])
+	}
+	if files["demo-1.0/vendor/mid.txt"] != "mid\n" {
+		t.Fatalf("mid.txt: %q", files["demo-1.0/vendor/mid.txt"])
+	}
+	if files["demo-1.0/vendor/nested/leaf.txt"] != "leaf\n" {
+		t.Fatalf("leaf.txt: %q", files["demo-1.0/vendor/nested/leaf.txt"])
+	}
+	if _, ok := files["demo-1.0/dirty.txt"]; ok {
+		t.Fatal("archive includes untracked dirty.txt")
+	}
+}
+
+func rewriteGitmodulesURL(t *testing.T, path, from, to string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte(from)) {
+		t.Fatalf("%s does not contain %s\n%s", path, from, data)
+	}
+	if err := os.WriteFile(path, bytes.ReplaceAll(data, []byte(from), []byte(to)), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func tarFiles(t *testing.T, path string) map[string]string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	tr := tar.NewReader(bzip2.NewReader(f))
+	files := map[string]string{}
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			continue
+		}
+		b, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[hdr.Name] = string(b)
+	}
+	return files
 }
 
 func TestDockerArgs(t *testing.T) {
