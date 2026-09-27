@@ -1,6 +1,6 @@
 ARG SFOS_PLATFORM=linux/arm64
 
-FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS tools
+FROM --platform=$BUILDPLATFORM debian:trixie-slim AS tools
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends p7zip-full \
 	&& rm -rf /var/lib/apt/lists/*
