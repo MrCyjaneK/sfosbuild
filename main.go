@@ -170,7 +170,14 @@ func runDeploy(args []string) error {
 	if pkgName == "" {
 		return fmt.Errorf("no Name: in %s", pkgPath)
 	}
-	rpm, err := findMainRPM(outAbs, pkgName)
+	pkgVersion := os.Getenv("RPM_VERSION")
+	if pkgVersion == "" {
+		pkgVersion = specField(string(meta), "Version")
+	}
+	if pkgVersion == "" {
+		return fmt.Errorf("no Version: in %s (or RPM_VERSION)", pkgPath)
+	}
+	rpm, err := findMainRPM(outAbs, pkgName, pkgVersion, arch)
 	if err != nil {
 		return err
 	}
@@ -202,7 +209,7 @@ Workspace:
 
 Commands:
   build (default)  Package a project with specify + rpmbuild
-  deploy           ssh uname -m and /etc/os-release, build, copy RPM, install on device
+  deploy           ssh uname -m and /etc/os-release, build, install the main RPM for that architecture
                    device ~/.sfosbuild-os-version (x.x.x.x) overrides the probed OS version
   shell            docker run -i -t -v $HOME:$HOME:ro -v $wd:$wd -v m_root:/root -w $PWD in the SDK image
                    No command -> interactive sh -i. Rebuilds the image if hooks changed.
@@ -1265,41 +1272,96 @@ func remoteVersion(userHost string) (string, error) {
 	return v, nil
 }
 
-func findMainRPM(dir, pkgName string) (string, error) {
+// parseRPMFilename splits an rpmbuild filename, N-V-R.A.rpm. Name may contain hyphens.
+func parseRPMFilename(filename string) (name, version, release, arch string, ok bool) {
+	base := strings.TrimSuffix(filename, ".rpm")
+	if base == filename || base == "" {
+		return
+	}
+	dot := strings.LastIndex(base, ".")
+	if dot <= 0 {
+		return
+	}
+	arch = base[dot+1:]
+	nvr := base[:dot]
+	relDash := strings.LastIndex(nvr, "-")
+	if relDash <= 0 {
+		return
+	}
+	release = nvr[relDash+1:]
+	nv := nvr[:relDash]
+	verDash := strings.LastIndex(nv, "-")
+	if verDash <= 0 {
+		return
+	}
+	version = nv[verDash+1:]
+	name = nv[:verDash]
+	ok = name != "" && version != "" && release != "" && arch != ""
+	return
+}
+
+// findMainRPM returns the main package RPM for pkgName, version, and arch.
+// Subpackages (devel, debuginfo, …) and other architectures are ignored.
+// A noarch build is used when the package has no binary for arch.
+// When several releases of that version are present, the newest file wins.
+func findMainRPM(dir, pkgName, version, arch string) (string, error) {
 	if pkgName == "" {
 		return "", fmt.Errorf("empty package name")
+	}
+	if version == "" {
+		return "", fmt.Errorf("empty version")
+	}
+	if arch == "" {
+		return "", fmt.Errorf("empty arch")
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return "", err
 	}
-	prefix := pkgName + "-"
-	var candidates []string
+	var exact, noarch []string
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".rpm") {
+		if e.IsDir() {
 			continue
 		}
-		name := e.Name()
-		if !strings.HasPrefix(name, prefix) || strings.Contains(name, "debug") {
+		name, ver, _, rpmArch, ok := parseRPMFilename(e.Name())
+		if !ok || name != pkgName || ver != version {
 			continue
 		}
-		rest := strings.TrimSuffix(name, ".rpm")
-		rest = rest[len(pkgName)+1:]
-		for _, sub := range []string{"doc-", "tests-", "ts-devel-", "debuginfo", "debugsource"} {
-			if strings.HasPrefix(rest, sub) {
-				goto skip
-			}
+		path := filepath.Join(dir, e.Name())
+		switch rpmArch {
+		case arch:
+			exact = append(exact, path)
+		case "noarch":
+			noarch = append(noarch, path)
 		}
-		candidates = append(candidates, filepath.Join(dir, name))
-	skip:
+	}
+	candidates := exact
+	if len(candidates) == 0 {
+		candidates = noarch
 	}
 	if len(candidates) == 0 {
-		return "", fmt.Errorf("no main rpm for %s in %s", pkgName, dir)
+		return "", fmt.Errorf("no main rpm for %s-%s (%s) in %s", pkgName, version, arch, dir)
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return len(candidates[i]) < len(candidates[j])
-	})
-	return candidates[0], nil
+	return newestFile(candidates)
+}
+
+func newestFile(paths []string) (string, error) {
+	best := paths[0]
+	bestInfo, err := os.Stat(best)
+	if err != nil {
+		return "", err
+	}
+	for _, p := range paths[1:] {
+		info, err := os.Stat(p)
+		if err != nil {
+			return "", err
+		}
+		if info.ModTime().After(bestInfo.ModTime()) {
+			best = p
+			bestInfo = info
+		}
+	}
+	return best, nil
 }
 
 func installRPM(userHost, rpmPath string) error {

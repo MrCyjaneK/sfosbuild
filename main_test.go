@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeArch(t *testing.T) {
@@ -695,29 +696,53 @@ SAILFISH_BUILD=11
 	}
 }
 
+func TestParseRPMFilename(t *testing.T) {
+	name, ver, rel, arch, ok := parseRPMFilename("sailfish-components-gallery-qt5-1.3.0-1.aarch64.rpm")
+	if !ok || name != "sailfish-components-gallery-qt5" || ver != "1.3.0" || rel != "1" || arch != "aarch64" {
+		t.Fatalf("got %q %q %q %q ok=%v", name, ver, rel, arch, ok)
+	}
+	name, _, _, _, ok = parseRPMFilename("pkg-debuginfo-1.0-1.aarch64.rpm")
+	if !ok || name != "pkg-debuginfo" {
+		t.Fatalf("debuginfo name %q ok=%v", name, ok)
+	}
+	if _, _, _, _, ok = parseRPMFilename("pkg-1.0.rpm"); ok {
+		t.Fatal("expected incomplete filename to fail")
+	}
+}
+
 func TestFindMainRPM(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := findMainRPM(dir, "pkg"); err == nil {
+	if _, err := findMainRPM(dir, "pkg", "1.0", "aarch64"); err == nil {
 		t.Fatal("expected empty dir error")
 	}
-	if err := os.WriteFile(filepath.Join(dir, "pkg-1.0-debuginfo.rpm"), []byte("debug"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "pkg-debuginfo-1.0-1.aarch64.rpm"), []byte("debug"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	main := filepath.Join(dir, "pkg-1.0.rpm")
+	if _, err := findMainRPM(dir, "pkg", "1.0", "aarch64"); err == nil {
+		t.Fatal("debuginfo is not the main rpm")
+	}
+	main := filepath.Join(dir, "pkg-1.0-1.aarch64.rpm")
 	if err := os.WriteFile(main, []byte("pkg"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	got, err := findMainRPM(dir, "pkg")
+	// Shorter names that must not win: other arch, subpackages, other version.
+	for _, name := range []string{
+		"pkg-1.0-1.i486.rpm",
+		"pkg-devel-1.0-1.aarch64.rpm",
+		"pkg-ts-devel-1.0-1.aarch64.rpm",
+		"pkg-debugsource-1.0-1.aarch64.rpm",
+		"pkg-1-1.aarch64.rpm",
+		"pkg-doc-1.0-1.noarch.rpm",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := findMainRPM(dir, "pkg", "1.0", "aarch64")
 	if err != nil || got != main {
-		t.Fatalf("got %q err %v", got, err)
+		t.Fatalf("got %q want %q err %v", got, main, err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "pkg-ts-devel-1.0.rpm"), []byte("ts"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	got, err = findMainRPM(dir, "pkg")
-	if err != nil || got != main {
-		t.Fatalf("subpkg skip: got %q err %v", got, err)
-	}
+
 	galleryMain := filepath.Join(dir, "sailfish-components-gallery-qt5-1.3.0-1.aarch64.rpm")
 	if err := os.WriteFile(galleryMain, []byte("main"), 0644); err != nil {
 		t.Fatal(err)
@@ -725,9 +750,43 @@ func TestFindMainRPM(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "sailfish-components-gallery-qt5-ts-devel-1.3.0-1.aarch64.rpm"), []byte("ts"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	got, err = findMainRPM(dir, "sailfish-components-gallery-qt5")
+	got, err = findMainRPM(dir, "sailfish-components-gallery-qt5", "1.3.0", "aarch64")
 	if err != nil || got != galleryMain {
 		t.Fatalf("got %q want %q err %v", got, galleryMain, err)
+	}
+
+	older := filepath.Join(dir, "pkg-1.0-1.aarch64.rpm")
+	newer := filepath.Join(dir, "pkg-1.0-2.aarch64.rpm")
+	if err := os.WriteFile(newer, []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(older, past, past); err != nil {
+		t.Fatal(err)
+	}
+	got, err = findMainRPM(dir, "pkg", "1.0", "aarch64")
+	if err != nil || got != newer {
+		t.Fatalf("release: got %q want %q err %v", got, newer, err)
+	}
+
+	noarch := filepath.Join(dir, "data-2.0-1.noarch.rpm")
+	if err := os.WriteFile(noarch, []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "data-2.0-1.i486.rpm"), []byte("wrong"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err = findMainRPM(dir, "data", "2.0", "aarch64")
+	if err != nil || got != noarch {
+		t.Fatalf("noarch: got %q want %q err %v", got, noarch, err)
+	}
+	archSpecific := filepath.Join(dir, "data-2.0-1.aarch64.rpm")
+	if err := os.WriteFile(archSpecific, []byte("bin"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err = findMainRPM(dir, "data", "2.0", "aarch64")
+	if err != nil || got != archSpecific {
+		t.Fatalf("arch over noarch: got %q want %q err %v", got, archSpecific, err)
 	}
 }
 

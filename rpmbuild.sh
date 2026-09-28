@@ -52,7 +52,7 @@ rpmbuild $inplace -bb \
 	--target "$RPM_TARGET" \
 	"$spec"
 
-find "$TOP/RPMS" -type f -name '*.rpm' ! -name '*debug*' -exec cp -f {} "$OUT"/ \;
+find "$TOP/RPMS" -type f -name '*.rpm' -exec cp -f {} "$OUT"/ \;
 ls -l "$OUT"
 
 if [ -n "${HOST_UID:-}" ]; then
