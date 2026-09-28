@@ -710,82 +710,92 @@ func TestParseRPMFilename(t *testing.T) {
 	}
 }
 
-func TestFindMainRPM(t *testing.T) {
+func TestFindDeployRPMs(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := findMainRPM(dir, "pkg", "1.0", "aarch64"); err == nil {
+	if _, err := findDeployRPMs(dir, "pkg", "1.0", "aarch64"); err == nil {
 		t.Fatal("expected empty dir error")
 	}
-	if err := os.WriteFile(filepath.Join(dir, "pkg-debuginfo-1.0-1.aarch64.rpm"), []byte("debug"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := findMainRPM(dir, "pkg", "1.0", "aarch64"); err == nil {
-		t.Fatal("debuginfo is not the main rpm")
-	}
-	main := filepath.Join(dir, "pkg-1.0-1.aarch64.rpm")
-	if err := os.WriteFile(main, []byte("pkg"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	// Shorter names that must not win: other arch, subpackages, other version.
-	for _, name := range []string{
-		"pkg-1.0-1.i486.rpm",
-		"pkg-devel-1.0-1.aarch64.rpm",
-		"pkg-ts-devel-1.0-1.aarch64.rpm",
-		"pkg-debugsource-1.0-1.aarch64.rpm",
-		"pkg-1-1.aarch64.rpm",
-		"pkg-doc-1.0-1.noarch.rpm",
-	} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0644); err != nil {
+	write := func(name string) string {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(name), 0644); err != nil {
 			t.Fatal(err)
 		}
+		return p
 	}
-	got, err := findMainRPM(dir, "pkg", "1.0", "aarch64")
-	if err != nil || got != main {
-		t.Fatalf("got %q want %q err %v", got, main, err)
+	main := write("pkg-1.0-1.aarch64.rpm")
+	devel := write("pkg-devel-1.0-1.aarch64.rpm")
+	doc := write("pkg-doc-1.0-1.noarch.rpm")
+	ts := write("pkg-ts-devel-1.0-1.aarch64.rpm")
+	debuginfo := write("pkg-debuginfo-1.0-1.aarch64.rpm")
+	debugsource := write("pkg-debugsource-1.0-1.aarch64.rpm")
+	write("pkg-1.0-1.i486.rpm")
+	write("pkg-1-1.aarch64.rpm")
+	write("other-1.0-1.aarch64.rpm")
+
+	got, err := findDeployRPMs(dir, "pkg", "1.0", "aarch64")
+	want := []string{main, devel, doc, ts, debuginfo, debugsource}
+	if err != nil || strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("got %q\nwant %q\nerr %v", got, want, err)
 	}
 
-	galleryMain := filepath.Join(dir, "sailfish-components-gallery-qt5-1.3.0-1.aarch64.rpm")
+	galleryDir := t.TempDir()
+	galleryMain := filepath.Join(galleryDir, "sailfish-components-gallery-qt5-1.3.0-1.aarch64.rpm")
+	galleryTS := filepath.Join(galleryDir, "sailfish-components-gallery-qt5-ts-devel-1.3.0-1.aarch64.rpm")
 	if err := os.WriteFile(galleryMain, []byte("main"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "sailfish-components-gallery-qt5-ts-devel-1.3.0-1.aarch64.rpm"), []byte("ts"), 0644); err != nil {
+	if err := os.WriteFile(galleryTS, []byte("ts"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	got, err = findMainRPM(dir, "sailfish-components-gallery-qt5", "1.3.0", "aarch64")
-	if err != nil || got != galleryMain {
-		t.Fatalf("got %q want %q err %v", got, galleryMain, err)
+	got, err = findDeployRPMs(galleryDir, "sailfish-components-gallery-qt5", "1.3.0", "aarch64")
+	want = []string{galleryMain, galleryTS}
+	if err != nil || strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("gallery: got %q want %q err %v", got, want, err)
 	}
 
-	older := filepath.Join(dir, "pkg-1.0-1.aarch64.rpm")
-	newer := filepath.Join(dir, "pkg-1.0-2.aarch64.rpm")
-	if err := os.WriteFile(newer, []byte("new"), 0644); err != nil {
-		t.Fatal(err)
+	rel2 := write("pkg-1.0-2.aarch64.rpm")
+	rel2devel := write("pkg-devel-1.0-2.aarch64.rpm")
+	rel2debug := write("pkg-debuginfo-1.0-2.aarch64.rpm")
+	past := time.Now().Add(-2 * time.Hour)
+	for _, name := range []string{
+		"pkg-1.0-1.aarch64.rpm",
+		"pkg-devel-1.0-1.aarch64.rpm",
+		"pkg-doc-1.0-1.noarch.rpm",
+		"pkg-ts-devel-1.0-1.aarch64.rpm",
+		"pkg-debuginfo-1.0-1.aarch64.rpm",
+		"pkg-debugsource-1.0-1.aarch64.rpm",
+	} {
+		if err := os.Chtimes(filepath.Join(dir, name), past, past); err != nil {
+			t.Fatal(err)
+		}
 	}
-	past := time.Now().Add(-time.Hour)
-	if err := os.Chtimes(older, past, past); err != nil {
-		t.Fatal(err)
-	}
-	got, err = findMainRPM(dir, "pkg", "1.0", "aarch64")
-	if err != nil || got != newer {
-		t.Fatalf("release: got %q want %q err %v", got, newer, err)
+	got, err = findDeployRPMs(dir, "pkg", "1.0", "aarch64")
+	want = []string{rel2, rel2devel, rel2debug}
+	if err != nil || strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("release: got %q want %q err %v", got, want, err)
 	}
 
-	noarch := filepath.Join(dir, "data-2.0-1.noarch.rpm")
+	noarchDir := t.TempDir()
+	noarch := filepath.Join(noarchDir, "data-2.0-1.noarch.rpm")
 	if err := os.WriteFile(noarch, []byte("data"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "data-2.0-1.i486.rpm"), []byte("wrong"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(noarchDir, "data-2.0-1.i486.rpm"), []byte("wrong"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	got, err = findMainRPM(dir, "data", "2.0", "aarch64")
-	if err != nil || got != noarch {
-		t.Fatalf("noarch: got %q want %q err %v", got, noarch, err)
+	got, err = findDeployRPMs(noarchDir, "data", "2.0", "aarch64")
+	want = []string{noarch}
+	if err != nil || strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("noarch: got %q want %q err %v", got, want, err)
 	}
-	archSpecific := filepath.Join(dir, "data-2.0-1.aarch64.rpm")
+	archSpecific := filepath.Join(noarchDir, "data-2.0-1.aarch64.rpm")
 	if err := os.WriteFile(archSpecific, []byte("bin"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	got, err = findMainRPM(dir, "data", "2.0", "aarch64")
-	if err != nil || got != archSpecific {
+	got, err = findDeployRPMs(noarchDir, "data", "2.0", "aarch64")
+	want = []string{archSpecific}
+	if err != nil || strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("arch over noarch: got %q want %q err %v", got, archSpecific, err)
 	}
 }

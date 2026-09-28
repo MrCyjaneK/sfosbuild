@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 //go:embed Dockerfile unpack.sh prepare.sh rpmbuild.sh install-builddeps.sh
@@ -177,11 +178,16 @@ func runDeploy(args []string) error {
 	if pkgVersion == "" {
 		return fmt.Errorf("no Version: in %s (or RPM_VERSION)", pkgPath)
 	}
-	rpm, err := findMainRPM(outAbs, pkgName, pkgVersion, arch)
+	rpms, err := findDeployRPMs(outAbs, pkgName, pkgVersion, arch)
 	if err != nil {
 		return err
 	}
-	return installRPM(userHost, rpm)
+	for _, rpm := range rpms {
+		if err := installRPM(userHost, rpm); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func usage(w io.Writer) {
@@ -209,7 +215,7 @@ Workspace:
 
 Commands:
   build (default)  Package a project with specify + rpmbuild
-  deploy           ssh uname -m and /etc/os-release, build, install the main RPM for that architecture
+  deploy           ssh uname -m and /etc/os-release, build, install the RPMs for that architecture
                    device ~/.sfosbuild-os-version (x.x.x.x) overrides the probed OS version
   shell            docker run -i -t -v $HOME:$HOME:ro -v $wd:$wd -v m_root:/root -w $PWD in the SDK image
                    No command -> interactive sh -i. Rebuilds the image if hooks changed.
@@ -1300,68 +1306,109 @@ func parseRPMFilename(filename string) (name, version, release, arch string, ok 
 	return
 }
 
-// findMainRPM returns the main package RPM for pkgName, version, and arch.
-// Subpackages (devel, debuginfo, …) and other architectures are ignored.
-// A noarch build is used when the package has no binary for arch.
-// When several releases of that version are present, the newest file wins.
-func findMainRPM(dir, pkgName, version, arch string) (string, error) {
+type rpmFile struct {
+	path    string
+	name    string
+	release string
+	arch    string
+	mod     time.Time
+}
+
+// findDeployRPMs returns the RPMs this build produced for arch: the spec
+// package, its subpackages, and noarch packages of the same version.
+// Other architectures and older releases left in the output directory are
+// skipped. The main package is first so subpackages can depend on it.
+func findDeployRPMs(dir, pkgName, version, arch string) ([]string, error) {
 	if pkgName == "" {
-		return "", fmt.Errorf("empty package name")
+		return nil, fmt.Errorf("empty package name")
 	}
 	if version == "" {
-		return "", fmt.Errorf("empty version")
+		return nil, fmt.Errorf("empty version")
 	}
 	if arch == "" {
-		return "", fmt.Errorf("empty arch")
+		return nil, fmt.Errorf("empty arch")
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	var exact, noarch []string
+	var matched []rpmFile
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		name, ver, _, rpmArch, ok := parseRPMFilename(e.Name())
-		if !ok || name != pkgName || ver != version {
+		name, ver, rel, rpmArch, ok := parseRPMFilename(e.Name())
+		if !ok || ver != version {
 			continue
 		}
-		path := filepath.Join(dir, e.Name())
-		switch rpmArch {
-		case arch:
-			exact = append(exact, path)
-		case "noarch":
-			noarch = append(noarch, path)
+		if name != pkgName && !strings.HasPrefix(name, pkgName+"-") {
+			continue
+		}
+		if rpmArch != arch && rpmArch != "noarch" {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			return nil, err
+		}
+		matched = append(matched, rpmFile{
+			path:    filepath.Join(dir, e.Name()),
+			name:    name,
+			release: rel,
+			arch:    rpmArch,
+			mod:     info.ModTime(),
+		})
+	}
+	if len(matched) == 0 {
+		return nil, fmt.Errorf("no rpms for %s-%s (%s) in %s", pkgName, version, arch, dir)
+	}
+	newest := matched[0]
+	for _, f := range matched[1:] {
+		if f.mod.After(newest.mod) {
+			newest = f
 		}
 	}
-	candidates := exact
-	if len(candidates) == 0 {
-		candidates = noarch
+	hasArch := map[string]bool{}
+	for _, f := range matched {
+		if f.release == newest.release && f.arch == arch {
+			hasArch[f.name] = true
+		}
 	}
-	if len(candidates) == 0 {
-		return "", fmt.Errorf("no main rpm for %s-%s (%s) in %s", pkgName, version, arch, dir)
+	var chosen []rpmFile
+	for _, f := range matched {
+		if f.release != newest.release {
+			continue
+		}
+		if f.arch == "noarch" && hasArch[f.name] {
+			continue
+		}
+		chosen = append(chosen, f)
 	}
-	return newestFile(candidates)
+	sort.Slice(chosen, func(i, j int) bool {
+		ri, rj := deployRank(pkgName, arch, chosen[i]), deployRank(pkgName, arch, chosen[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return chosen[i].path < chosen[j].path
+	})
+	out := make([]string, len(chosen))
+	for i, f := range chosen {
+		out[i] = f.path
+	}
+	return out, nil
 }
 
-func newestFile(paths []string) (string, error) {
-	best := paths[0]
-	bestInfo, err := os.Stat(best)
-	if err != nil {
-		return "", err
+func deployRank(pkgName, arch string, f rpmFile) int {
+	switch {
+	case f.name == pkgName && f.arch == arch:
+		return 0
+	case f.name == pkgName:
+		return 1
+	case strings.HasSuffix(f.name, "-debuginfo"), strings.HasSuffix(f.name, "-debugsource"):
+		return 3
+	default:
+		return 2
 	}
-	for _, p := range paths[1:] {
-		info, err := os.Stat(p)
-		if err != nil {
-			return "", err
-		}
-		if info.ModTime().After(bestInfo.ModTime()) {
-			best = p
-			bestInfo = info
-		}
-	}
-	return best, nil
 }
 
 func installRPM(userHost, rpmPath string) error {
