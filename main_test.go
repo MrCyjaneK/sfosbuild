@@ -446,6 +446,7 @@ func TestDockerArgs(t *testing.T) {
 	joined = strings.Join(run, " ")
 	for _, want := range []string{
 		"run --rm",
+		"--network none",
 		"--label sfosbuild=1",
 		"--platform linux/386",
 		"-e SFOS_ARCH=i486",
@@ -818,6 +819,7 @@ func TestUsage(t *testing.T) {
 		"--in-place",
 		"--source",
 		"device ~/.sfosbuild-os-version",
+		"--network=none",
 		"<prefix>_<workspace>",
 	} {
 		if !strings.Contains(s, want) {

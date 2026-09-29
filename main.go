@@ -243,9 +243,10 @@ Architectures: aarch64, armv7hl (armv7a), i486, all
 The project needs rpm/*.yaml (spectacle). specify runs in the SDK image
 to generate the spec. build packages the git HEAD tree as Source0,
 including submodules already present in the local repository, and runs a
-clean rpmbuild. --in-place and deploy use rpmbuild --build-in-place
-on the working tree. Drop the previous arch's build tree first (make clean
-and make distclean) so that cache is not packaged.
+clean rpmbuild. That container runs with --network=none. SDK image setup
+and build-requires install still use the network. --in-place and deploy use
+rpmbuild --build-in-place on the working tree. Drop the previous arch's
+build tree first (make clean and make distclean) so that cache is not packaged.
 Images are tagged <prefix>_<workspace>:<version>-<arch>, where
 <workspace> is the directory that contains .sfosbuild/.
 `)
@@ -1175,6 +1176,7 @@ func dockerRunArgs(tag, platform, arch, project, topdir, script, out, merRoot, h
 	workdir := "/rpmbuild"
 	args := []string{
 		"run", "--rm",
+		"--network", "none",
 		"--label", dockerRunLabel,
 		"--platform", platform,
 		"-e", "SFOS_ARCH=" + arch,
