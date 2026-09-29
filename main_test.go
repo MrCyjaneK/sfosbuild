@@ -84,12 +84,12 @@ func TestParseArgs(t *testing.T) {
 		t.Fatalf("%+v", cfg)
 	}
 
-	cfg, err = parseArgs([]string{"--in-place", "5.1.0.11", "aarch64", dir})
+	cfg, err = parseArgs([]string{"--in-place", "--source", "5.1.0.11", "aarch64", dir})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.InPlace {
-		t.Fatal("expected in-place")
+	if !cfg.InPlace || !cfg.Source {
+		t.Fatal("expected in-place and source")
 	}
 
 	cfg, err = parseArgs([]string{"--help"})
@@ -442,7 +442,7 @@ func TestDockerArgs(t *testing.T) {
 		}
 	}
 
-	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root", "/home/user", true)
+	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root", "/home/user", true, true)
 	joined = strings.Join(run, " ")
 	for _, want := range []string{
 		"run --rm",
@@ -451,6 +451,7 @@ func TestDockerArgs(t *testing.T) {
 		"-e SFOS_ARCH=i486",
 		"-v /home/user:/home/user:ro",
 		"-e SFOS_INPLACE=1",
+		"-e SFOS_SOURCE=1",
 		"/proj:/build",
 		"/top:/rpmbuild",
 		"-w /build",
@@ -464,8 +465,8 @@ func TestDockerArgs(t *testing.T) {
 		}
 	}
 
-	clean := strings.Join(dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root", "/home/user", false), " ")
-	if strings.Contains(clean, "/proj:/build") || strings.Contains(clean, "SFOS_INPLACE") {
+	clean := strings.Join(dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root", "/home/user", false, false), " ")
+	if strings.Contains(clean, "/proj:/build") || strings.Contains(clean, "SFOS_INPLACE") || strings.Contains(clean, "SFOS_SOURCE") {
 		t.Fatalf("clean build should not mount the project: %s", clean)
 	}
 	if !strings.Contains(clean, "-w /rpmbuild") {
@@ -731,6 +732,7 @@ func TestFindDeployRPMs(t *testing.T) {
 	debugsource := write("pkg-debugsource-1.0-1.aarch64.rpm")
 	write("pkg-1.0-1.i486.rpm")
 	write("pkg-1-1.aarch64.rpm")
+	write("pkg-1.0-1.src.rpm")
 	write("other-1.0-1.aarch64.rpm")
 
 	got, err := findDeployRPMs(dir, "pkg", "1.0", "aarch64")
@@ -814,6 +816,7 @@ func TestUsage(t *testing.T) {
 		"sfosbuild build",
 		"sfosbuild deploy",
 		"--in-place",
+		"--source",
 		"device ~/.sfosbuild-os-version",
 		"<prefix>_<workspace>",
 	} {

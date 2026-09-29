@@ -44,7 +44,12 @@ else
 	SOURCEDIR="$TOP/SOURCES"
 fi
 
-rpmbuild $inplace -bb \
+mode=-bb
+if [ "${SFOS_SOURCE:-}" = 1 ]; then
+	mode=-ba
+fi
+
+rpmbuild $inplace $mode \
 	--define "_topdir ${TOP}" \
 	--define "_sourcedir ${SOURCEDIR}" \
 	--define "_missing_build_ids_terminate_build 0" \
@@ -53,6 +58,9 @@ rpmbuild $inplace -bb \
 	"$spec"
 
 find "$TOP/RPMS" -type f -name '*.rpm' -exec cp -f {} "$OUT"/ \;
+if [ "${SFOS_SOURCE:-}" = 1 ]; then
+	find "$TOP/SRPMS" -type f -name '*.rpm' -exec cp -f {} "$OUT"/ \;
+fi
 ls -l "$OUT"
 
 if [ -n "${HOST_UID:-}" ]; then

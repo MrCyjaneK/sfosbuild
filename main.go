@@ -46,6 +46,7 @@ type config struct {
 	Output      string
 	Rebuild     bool
 	InPlace     bool // working tree via rpmbuild --build-in-place; otherwise git archive of HEAD and local submodules
+	Source      bool // rpmbuild -ba and copy SRPMS into the output directory
 	ImagePrefix string
 	Root        string // $wd: directory that contains .sfosbuild/
 	WorkDir     string // host cwd, used as docker -w
@@ -231,6 +232,7 @@ Examples:
 Options:
   -o, --output DIR     RPM output directory (default: <project>/rpms)
   --in-place           rpmbuild --build-in-place on the working tree
+  --source             also build the .src.rpm and copy SRPMS to the output directory
   --rebuild            rebuild SDK images even if they exist
   --image-prefix NAME  docker image prefix (default: sfosbuild)
   -h, --help           show this help
@@ -263,6 +265,8 @@ func parseFlags(args []string) (*config, []string, error) {
 			return nil, nil, nil
 		case a == "--in-place" || a == "-in-place":
 			cfg.InPlace = true
+		case a == "--source":
+			cfg.Source = true
 		case a == "--rebuild":
 			cfg.Rebuild = true
 		case a == "-o" || a == "--output":
@@ -1160,14 +1164,14 @@ func buildArch(cfg *config, arch, pkgPath, meta, name, version, out, sourceTar s
 	if err != nil {
 		return err
 	}
-	args := dockerRunArgs(tag, archPlatform[arch], arch, cfg.Project, topdir, script, out, merRoot, home, cfg.InPlace)
+	args := dockerRunArgs(tag, archPlatform[arch], arch, cfg.Project, topdir, script, out, merRoot, home, cfg.InPlace, cfg.Source)
 	if err := runCmd(dockerCmd(args...)); err != nil {
 		return fmt.Errorf("docker run: %w", err)
 	}
 	return nil
 }
 
-func dockerRunArgs(tag, platform, arch, project, topdir, script, out, merRoot, home string, inPlace bool) []string {
+func dockerRunArgs(tag, platform, arch, project, topdir, script, out, merRoot, home string, inPlace, source bool) []string {
 	workdir := "/rpmbuild"
 	args := []string{
 		"run", "--rm",
@@ -1184,6 +1188,9 @@ func dockerRunArgs(tag, platform, arch, project, topdir, script, out, merRoot, h
 			"-e", "SFOS_INPLACE=1",
 			"-v", project+":/build",
 		)
+	}
+	if source {
+		args = append(args, "-e", "SFOS_SOURCE=1")
 	}
 	args = append(args,
 		"-v", topdir+":/rpmbuild",
