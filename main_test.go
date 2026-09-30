@@ -496,14 +496,17 @@ func TestImageTag(t *testing.T) {
 
 func TestBuildDepsHash(t *testing.T) {
 	meta := "Name: demo\nVersion: 1.0\nBuildRequires: gcc\n"
-	h1 := buildDepsHash(meta, "1.0")
-	h2 := buildDepsHash(meta, "2.0")
+	h1 := buildDepsHash(meta, "1.0", "sha256:base")
+	h2 := buildDepsHash(meta, "2.0", "sha256:base")
 	if h1 == h2 || h1 == "" {
 		t.Fatalf("hash should differ with version: %q %q", h1, h2)
 	}
-	h3 := buildDepsHash(meta, "2.0")
+	h3 := buildDepsHash(meta, "2.0", "sha256:base")
 	if h2 != h3 {
 		t.Fatalf("hash unstable: %q %q", h2, h3)
+	}
+	if buildDepsHash(meta, "2.0", "sha256:other") == h2 {
+		t.Fatal("hash should differ with base image")
 	}
 }
 

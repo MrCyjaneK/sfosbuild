@@ -566,9 +566,10 @@ func imageBuildTag(prefix, root, version, arch, depsHash string) string {
 	return fmt.Sprintf("%s:%s-%s-%s", imageRepo(prefix, root), version, arch, depsHash)
 }
 
-func buildDepsHash(meta, version string) string {
+func buildDepsHash(meta, version, baseID string) string {
 	h := sha256.New()
 	h.Write([]byte(patchVersion(meta, version)))
+	h.Write([]byte(baseID))
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
@@ -996,6 +997,14 @@ func ensureImage(cfg *config, arch string) error {
 	return buildImage(tag, cfg.Version, arch, cfg.Root, hash)
 }
 
+func imageID(tag string) (string, error) {
+	out, err := exec.Command("docker", "image", "inspect", "-f", "{{.Id}}", tag).Output()
+	if err != nil {
+		return "", fmt.Errorf("image %s: %w", tag, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 func imageExists(tag string) bool {
 	cmd := exec.Command("docker", "image", "inspect", tag)
 	cmd.Stdout = io.Discard
@@ -1075,7 +1084,11 @@ func dockerBuildArgs(tag, context, version, arch, platform, md5, hash string) []
 
 func ensureBuildDepsImage(cfg *config, arch, pkgPath, meta, name, version string) (string, error) {
 	base := imageTag(cfg.ImagePrefix, cfg.Root, cfg.Version, arch)
-	depsHash := buildDepsHash(meta, version)
+	baseID, err := imageID(base)
+	if err != nil {
+		return "", err
+	}
+	depsHash := buildDepsHash(meta, version, baseID)
 	tag := imageBuildTag(cfg.ImagePrefix, cfg.Root, cfg.Version, arch, depsHash)
 	if !cfg.Rebuild && imageExists(tag) && imageBuildDepsHash(tag) == depsHash {
 		log.Printf("image %s", tag)
