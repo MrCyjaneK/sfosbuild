@@ -84,26 +84,10 @@ func runBuild(cfg *config) error {
 	if err := withWorkspace(cfg); err != nil {
 		return err
 	}
-	pkgPath, err := findPkg(cfg.Project)
+	pkgs, err := findPkgs(cfg.Project)
 	if err != nil {
 		return err
 	}
-	meta, err := os.ReadFile(pkgPath)
-	if err != nil {
-		return err
-	}
-	name := specField(string(meta), "Name")
-	if name == "" {
-		return fmt.Errorf("no Name: in %s", pkgPath)
-	}
-	version := os.Getenv("RPM_VERSION")
-	if version == "" {
-		version = specField(string(meta), "Version")
-	}
-	if version == "" {
-		return fmt.Errorf("no Version: in %s (or RPM_VERSION)", pkgPath)
-	}
-
 	if err := os.MkdirAll(cfg.Output, 0755); err != nil {
 		return err
 	}
@@ -111,7 +95,32 @@ func runBuild(cfg *config) error {
 	if err != nil {
 		return err
 	}
+	for _, pkgPath := range pkgs {
+		if err := buildPkg(cfg, pkgPath, outAbs); err != nil {
+			return err
+		}
+	}
+	log.Printf("rpms in %s", outAbs)
+	return nil
+}
 
+func buildPkg(cfg *config, pkgPath, outAbs string) error {
+	meta, err := os.ReadFile(pkgPath)
+	if err != nil {
+		return err
+	}
+	text := string(meta)
+	name := specField(text, "Name")
+	if name == "" {
+		return fmt.Errorf("no Name: in %s", pkgPath)
+	}
+	version := os.Getenv("RPM_VERSION")
+	if version == "" {
+		version = specField(text, "Version")
+	}
+	if version == "" {
+		return fmt.Errorf("no Version: in %s (or RPM_VERSION)", pkgPath)
+	}
 	var sourceTar string
 	if !cfg.InPlace {
 		tarPath, tarCleanup, err := writeGitArchive(cfg.Project, name, version)
@@ -122,14 +131,12 @@ func runBuild(cfg *config) error {
 		sourceTar = tarPath
 		log.Printf("source %s", filepath.Base(sourceTar))
 	}
-
 	for _, arch := range cfg.Arches {
 		log.Printf("%s %s %s", cfg.Version, arch, name)
-		if err := buildArch(cfg, arch, pkgPath, string(meta), name, version, outAbs, sourceTar); err != nil {
+		if err := buildArch(cfg, arch, pkgPath, text, name, version, outAbs, sourceTar); err != nil {
 			return fmt.Errorf("%s: %w", arch, err)
 		}
 	}
-	log.Printf("rpms in %s", outAbs)
 	return nil
 }
 
@@ -160,32 +167,34 @@ func runDeploy(args []string) error {
 	if err != nil {
 		return err
 	}
-	pkgPath, err := findPkg(cfg.Project)
+	pkgs, err := findPkgs(cfg.Project)
 	if err != nil {
 		return err
 	}
-	meta, err := os.ReadFile(pkgPath)
-	if err != nil {
-		return err
-	}
-	pkgName := specField(string(meta), "Name")
-	if pkgName == "" {
-		return fmt.Errorf("no Name: in %s", pkgPath)
-	}
-	pkgVersion := os.Getenv("RPM_VERSION")
-	if pkgVersion == "" {
-		pkgVersion = specField(string(meta), "Version")
-	}
-	if pkgVersion == "" {
-		return fmt.Errorf("no Version: in %s (or RPM_VERSION)", pkgPath)
-	}
-	rpms, err := findDeployRPMs(outAbs, pkgName, pkgVersion, arch)
-	if err != nil {
-		return err
-	}
-	for _, rpm := range rpms {
-		if err := installRPM(userHost, rpm); err != nil {
+	for _, pkgPath := range pkgs {
+		meta, err := os.ReadFile(pkgPath)
+		if err != nil {
 			return err
+		}
+		pkgName := specField(string(meta), "Name")
+		if pkgName == "" {
+			return fmt.Errorf("no Name: in %s", pkgPath)
+		}
+		pkgVersion := os.Getenv("RPM_VERSION")
+		if pkgVersion == "" {
+			pkgVersion = specField(string(meta), "Version")
+		}
+		if pkgVersion == "" {
+			return fmt.Errorf("no Version: in %s (or RPM_VERSION)", pkgPath)
+		}
+		rpms, err := findDeployRPMs(outAbs, pkgName, pkgVersion, arch)
+		if err != nil {
+			return err
+		}
+		for _, rpm := range rpms {
+			if err := installRPM(userHost, rpm); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -240,8 +249,10 @@ Options:
 Architectures: aarch64, armv7hl (armv7a), i486, all
   shell takes a single arch (not all).
 
-The project needs rpm/*.yaml (spectacle). specify runs in the SDK image
-to generate the spec. build packages the git HEAD tree as Source0,
+The project needs rpm/*.yaml (spectacle) or a spec. Every file in the first
+set that exists is built, in name order, so one directory can ship several
+packages. specify runs in the SDK image to generate the spec. build packages
+the git HEAD tree as Source0,
 including submodules already present in the local repository, and runs a
 clean rpmbuild. That container runs with --network=none. SDK image setup
 and build-requires install still use the network. --in-place and deploy use
@@ -573,7 +584,7 @@ func buildDepsHash(meta, version, baseID string) string {
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
-func findPkg(project string) (string, error) {
+func findPkgs(project string) ([]string, error) {
 	for _, g := range []string{
 		filepath.Join(project, "rpm", "*.yaml"),
 		filepath.Join(project, "*.yaml"),
@@ -582,16 +593,15 @@ func findPkg(project string) (string, error) {
 	} {
 		matches, err := filepath.Glob(g)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		if len(matches) == 1 {
-			return matches[0], nil
+		if len(matches) == 0 {
+			continue
 		}
-		if len(matches) > 1 {
-			return "", fmt.Errorf("multiple package files in %s", project)
-		}
+		sort.Strings(matches)
+		return matches, nil
 	}
-	return "", fmt.Errorf("no rpm/*.yaml in %s", project)
+	return nil, fmt.Errorf("no rpm/*.yaml in %s", project)
 }
 
 func specField(spec, field string) string {

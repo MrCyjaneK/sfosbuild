@@ -131,14 +131,27 @@ func TestFindPkg(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "rpm", "reversegearhead.yaml"), []byte("Name: reversegearhead\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	p, err := findPkg(dir)
+	p, err := findPkgs(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Base(p) != "reversegearhead.yaml" {
-		t.Fatalf("got %s", p)
+	if len(p) != 1 || filepath.Base(p[0]) != "reversegearhead.yaml" {
+		t.Fatalf("got %v", p)
 	}
-	if _, err := findPkg(t.TempDir()); err == nil {
+	if err := os.WriteFile(filepath.Join(dir, "rpm", "a.yaml"), []byte("Name: a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ignored.spec"), []byte("Name: no\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	p, err = findPkgs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p) != 2 || filepath.Base(p[0]) != "a.yaml" || filepath.Base(p[1]) != "reversegearhead.yaml" {
+		t.Fatalf("got %v", p)
+	}
+	if _, err := findPkgs(t.TempDir()); err == nil {
 		t.Fatal("expected missing yaml")
 	}
 }

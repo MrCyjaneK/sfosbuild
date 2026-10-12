@@ -21,6 +21,8 @@ Usage:
 
 `--in-place` is the same working-tree rpmbuild deploy already uses. Run `make clean` and `make distclean` in the project first so a previous architecture's build cache is not packaged.
 
+A project can contain more than one `rpm/*.yaml` (or spec). Each file is built, in name order, into the same output directory. Specs are used only when that directory has no yaml. Deploy installs every package it built.
+
 ## Hooks
 
 If you need to do some preparations inside of the image `.sfosbuild/image/*.sh`
