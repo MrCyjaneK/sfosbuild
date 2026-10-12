@@ -253,7 +253,9 @@ The project needs rpm/*.yaml (spectacle) or a spec. Every file in the first
 set that exists is built, in name order, so one directory can ship several
 packages. specify runs in the SDK image to generate the spec. build packages
 the git HEAD tree as Source0,
-including submodules already present in the local repository, and runs a
+including submodules already present in the local repository. Source and
+Patch files named by the spec are copied too, when they sit next to the
+spec. The rest of the tree is not. It then runs a
 clean rpmbuild. That container runs with --network=none. SDK image setup
 and build-requires install still use the network. --in-place and deploy use
 rpmbuild --build-in-place on the working tree. Drop the previous arch's
@@ -991,7 +993,85 @@ func prepareStage(pkgPath, meta, name, version, sourceTar string) (topdir, scrip
 			return "", "", nil, err
 		}
 	}
+	if err := stageDeclaredSources(filepath.Dir(pkgPath), topdir, patched, name, version); err != nil {
+		cleanup()
+		return "", "", nil, err
+	}
 	return topdir, script, cleanup, nil
+}
+
+// sourceTag matches spec lines such as "Source1: enable_decoders" and "Patch0: foo.patch".
+var sourceTag = regexp.MustCompile(`(?i)^(source|patch)[0-9]*\s*:\s*(\S+)`)
+
+// declaredSources lists Source and Patch files named by a spec or spectacle yaml.
+// The generated %{name}-%{version} tarball is not included.
+func declaredSources(meta, name, version string) []string {
+	generated := name + "-" + version + ".tar.bz2"
+	var out []string
+	seen := map[string]bool{}
+	section := ""
+	add := func(raw string) {
+		base := sourceFileName(raw, name, version)
+		if base == "" || base == generated || seen[base] {
+			return
+		}
+		seen[base] = true
+		out = append(out, base)
+	}
+	for _, line := range strings.Split(meta, "\n") {
+		trim := strings.TrimSpace(line)
+		if trim == "" || strings.HasPrefix(trim, "#") {
+			if trim == "" {
+				section = ""
+			}
+			continue
+		}
+		if m := sourceTag.FindStringSubmatch(trim); m != nil {
+			section = ""
+			add(m[2])
+			continue
+		}
+		key := strings.TrimSuffix(trim, ":")
+		if !strings.ContainsAny(key, " \t") && (strings.EqualFold(key, "sources") || strings.EqualFold(key, "patches")) {
+			section = strings.ToLower(key)
+			continue
+		}
+		if section != "" && strings.HasPrefix(trim, "-") {
+			item := strings.Trim(strings.TrimSpace(strings.TrimPrefix(trim, "-")), `"'`)
+			if item != "" && !strings.ContainsAny(item, " \t") {
+				add(item)
+			}
+			continue
+		}
+		section = ""
+	}
+	return out
+}
+
+func sourceFileName(raw, name, version string) string {
+	raw = strings.Trim(strings.TrimSpace(raw), `"'`)
+	if raw == "" || strings.Contains(raw, "://") {
+		return ""
+	}
+	expanded := strings.NewReplacer("%{name}", name, "%{version}", version).Replace(raw)
+	return filepath.Base(expanded)
+}
+
+// stageDeclaredSources copies Source and Patch files that live next to the spec
+// into SOURCES. The git archive is already Source0. Other project files stay out.
+func stageDeclaredSources(specDir, topdir, meta, name, version string) error {
+	for _, base := range declaredSources(meta, name, version) {
+		src := filepath.Join(specDir, base)
+		st, err := os.Stat(src)
+		if err != nil || st.IsDir() {
+			return fmt.Errorf("source %s is not next to the spec", base)
+		}
+		if err := cp(src, filepath.Join(topdir, "SOURCES", base)); err != nil {
+			return err
+		}
+		log.Printf("source %s", base)
+	}
+	return nil
 }
 
 func ensureImage(cfg *config, arch string) error {

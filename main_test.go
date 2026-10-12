@@ -196,6 +196,70 @@ Sources:
 	}
 }
 
+func TestPrepareStageDeclaredSources(t *testing.T) {
+	dir := t.TempDir()
+	rpm := filepath.Join(dir, "rpm")
+	if err := os.MkdirAll(rpm, 0755); err != nil {
+		t.Fatal(err)
+	}
+	spec := `Name: ffmpeg
+Version: 8.1.2
+Source:         %{name}-%{version}.tar.bz2
+Source1:        enable_decoders
+Source2:        enable_encoders
+Patch0:         extra.patch
+Source3:        https://example.com/upstream.tar.gz
+`
+	specPath := filepath.Join(rpm, "ffmpeg.spec")
+	if err := os.WriteFile(specPath, []byte(spec), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"enable_decoders", "enable_encoders", "extra.patch", "notes.txt"} {
+		if err := os.WriteFile(filepath.Join(rpm, name), []byte(name), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.c"), []byte("int main(){}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	top, _, cleanup, err := prepareStage(specPath, spec, "ffmpeg", "8.1.2", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	for _, name := range []string{"enable_decoders", "enable_encoders", "extra.patch"} {
+		body, err := os.ReadFile(filepath.Join(top, "SOURCES", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != name {
+			t.Fatalf("SOURCES/%s = %q", name, body)
+		}
+	}
+	for _, name := range []string{"notes.txt", "ffmpeg-8.1.2.tar.bz2", "upstream.tar.gz", "ffmpeg.spec", "main.c"} {
+		if _, err := os.Stat(filepath.Join(top, "SOURCES", name)); err == nil {
+			t.Fatalf("SOURCES should not contain %s", name)
+		}
+	}
+}
+
+func TestPrepareStageMissingDeclaredSource(t *testing.T) {
+	dir := t.TempDir()
+	spec := "Name: ffmpeg\nVersion: 8.1.2\nSource1: enable_decoders\n"
+	specPath := filepath.Join(dir, "ffmpeg.spec")
+	if err := os.WriteFile(specPath, []byte(spec), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, _, cleanup, err := prepareStage(specPath, spec, "ffmpeg", "8.1.2", "")
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err == nil || !strings.Contains(err.Error(), "enable_decoders") {
+		t.Fatalf("error %v", err)
+	}
+}
+
 func TestPrepareStageSource(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "main.c"), []byte("int main(){}"), 0644); err != nil {
