@@ -455,7 +455,7 @@ func TestDockerArgs(t *testing.T) {
 		}
 	}
 
-	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root", "/home/user", true, true)
+	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/cache/m_root", "/home/user", true, true)
 	joined = strings.Join(run, " ")
 	for _, want := range []string{
 		"run --rm",
@@ -470,7 +470,6 @@ func TestDockerArgs(t *testing.T) {
 		"/top:/rpmbuild",
 		"-w /build",
 		"/script.sh:/usr/bin/sfos-rpmbuild.sh:ro",
-		"/out:/out",
 		"/cache/m_root:/root",
 		"sfosbuild:5.1.0.11-i486 sh /usr/bin/sfos-rpmbuild.sh",
 	} {
@@ -478,13 +477,69 @@ func TestDockerArgs(t *testing.T) {
 			t.Fatalf("missing %q in %s", want, joined)
 		}
 	}
+	if strings.Contains(joined, ":/out") {
+		t.Fatalf("output directory must not be bind-mounted: %s", joined)
+	}
 
-	clean := strings.Join(dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/out", "/cache/m_root", "/home/user", false, false), " ")
+	clean := strings.Join(dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/cache/m_root", "/home/user", false, false), " ")
 	if strings.Contains(clean, "/proj:/build") || strings.Contains(clean, "SFOS_INPLACE") || strings.Contains(clean, "SFOS_SOURCE") {
 		t.Fatalf("clean build should not mount the project: %s", clean)
 	}
 	if !strings.Contains(clean, "-w /rpmbuild") {
 		t.Fatalf("missing rpmbuild workdir in %s", clean)
+	}
+}
+
+func TestPublishRPMs(t *testing.T) {
+	top := t.TempDir()
+	archDir := filepath.Join(top, "RPMS", "aarch64")
+	if err := os.MkdirAll(archDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(top, "SRPMS"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		filepath.Join(archDir, "sfos_airpods-0.1.0-2.aarch64.rpm"),
+		filepath.Join(top, "SRPMS", "sfos_airpods-0.1.0-2.src.rpm"),
+		filepath.Join(top, "RPMS", "notes.txt"),
+	} {
+		if err := os.WriteFile(name, []byte(name), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := filepath.Join(t.TempDir(), "rpms")
+	if err := publishRPMs(top, out, false); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(out, "sfos_airpods-0.1.0-2.aarch64.rpm")
+	got, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != filepath.Join(archDir, "sfos_airpods-0.1.0-2.aarch64.rpm") {
+		t.Fatalf("binary rpm contents %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(out, "sfos_airpods-0.1.0-2.src.rpm")); !os.IsNotExist(err) {
+		t.Fatalf("source rpm copied without --source: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "notes.txt")); !os.IsNotExist(err) {
+		t.Fatalf("non-rpm copied: %v", err)
+	}
+
+	if err := publishRPMs(top, out, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "sfos_airpods-0.1.0-2.src.rpm")); err != nil {
+		t.Fatal(err)
+	}
+
+	empty := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(empty, "RPMS"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishRPMs(empty, out, false); err == nil {
+		t.Fatal("expected error when build produced no rpms")
 	}
 }
 

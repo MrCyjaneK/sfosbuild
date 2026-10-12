@@ -5,7 +5,6 @@ set -eu
 SFOS_ARCH="${SFOS_ARCH:-aarch64}"
 SRC=/build
 TOP=/rpmbuild
-OUT=/out
 
 case "$SFOS_ARCH" in
 aarch64) RPM_TARGET=aarch64-meego-linux ;;
@@ -21,7 +20,7 @@ if ! command -v specify >/dev/null; then
 	zypper --non-interactive in --force-resolution spectacle
 fi
 
-mkdir -p "$TOP/SPECS" "$TOP/BUILD" "$TOP/RPMS" "$TOP/SRPMS" "$OUT"
+mkdir -p "$TOP/SPECS" "$TOP/BUILD" "$TOP/RPMS" "$TOP/SRPMS"
 
 yaml=$(echo "$TOP"/rpm/*.yaml)
 if [ -f "$yaml" ]; then
@@ -57,12 +56,8 @@ rpmbuild $inplace $mode \
 	--target "$RPM_TARGET" \
 	"$spec"
 
-find "$TOP/RPMS" -type f -name '*.rpm' -exec cp -f {} "$OUT"/ \;
-if [ "${SFOS_SOURCE:-}" = 1 ]; then
-	find "$TOP/SRPMS" -type f -name '*.rpm' -exec cp -f {} "$OUT"/ \;
-fi
-ls -l "$OUT"
-
+# Host copies these off the /rpmbuild mount. The output directory is not
+# bind-mounted: it lives under $HOME, and VirtioFS drops that second mount.
 if [ -n "${HOST_UID:-}" ]; then
-	chown -R "${HOST_UID}:${HOST_GID:-$HOST_UID}" "$OUT" || true
+	chown -R "${HOST_UID}:${HOST_GID:-$HOST_UID}" "$TOP/RPMS" "$TOP/SRPMS" || true
 fi

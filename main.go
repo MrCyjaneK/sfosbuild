@@ -1188,14 +1188,52 @@ func buildArch(cfg *config, arch, pkgPath, meta, name, version, out, sourceTar s
 	if err != nil {
 		return err
 	}
-	args := dockerRunArgs(tag, archPlatform[arch], arch, cfg.Project, topdir, script, out, merRoot, home, cfg.InPlace, cfg.Source)
+	args := dockerRunArgs(tag, archPlatform[arch], arch, cfg.Project, topdir, script, merRoot, home, cfg.InPlace, cfg.Source)
 	if err := runCmd(dockerCmd(args...)); err != nil {
 		return fmt.Errorf("docker run: %w", err)
+	}
+	return publishRPMs(topdir, out, cfg.Source)
+}
+
+// publishRPMs copies built RPMs from the staging topdir onto the host output
+// directory. rpmbuild writes them on the /rpmbuild bind mount, under
+// RPMS/<arch>/; the output directory is flat, which is what deploy scans.
+// Source RPMs are included only when the build asked for them.
+func publishRPMs(topdir, out string, source bool) error {
+	if err := os.MkdirAll(out, 0755); err != nil {
+		return err
+	}
+	dirs := []string{filepath.Join(topdir, "RPMS")}
+	if source {
+		dirs = append(dirs, filepath.Join(topdir, "SRPMS"))
+	}
+	n := 0
+	for _, dir := range dirs {
+		err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() || !strings.HasSuffix(d.Name(), ".rpm") {
+				return nil
+			}
+			if err := cp(path, filepath.Join(out, d.Name())); err != nil {
+				return err
+			}
+			log.Printf("rpm %s", d.Name())
+			n++
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if n == 0 {
+		return fmt.Errorf("no rpms in %s", topdir)
 	}
 	return nil
 }
 
-func dockerRunArgs(tag, platform, arch, project, topdir, script, out, merRoot, home string, inPlace, source bool) []string {
+func dockerRunArgs(tag, platform, arch, project, topdir, script, merRoot, home string, inPlace, source bool) []string {
 	workdir := "/rpmbuild"
 	args := []string{
 		"run", "--rm",
@@ -1221,7 +1259,6 @@ func dockerRunArgs(tag, platform, arch, project, topdir, script, out, merRoot, h
 		"-v", topdir+":/rpmbuild",
 		"-w", workdir,
 		"-v", script+":/usr/bin/sfos-rpmbuild.sh:ro",
-		"-v", out+":/out",
 		"-v", merRoot+":/root",
 	)
 	if v := os.Getenv("CERTS_VERSION"); v != "" {
