@@ -123,6 +123,73 @@ Sources:
 	}
 }
 
+func TestPatchSourceArchive(t *testing.T) {
+	spec := "" +
+		"Name: ffmpeg\n" +
+		"Version: 8.1.2\n" +
+		"Source0:        %{name}-%{version}.tar.gz\n" +
+		"Source1:        extra.tar.gz\n" +
+		"Patch0:         extra.patch\n" +
+		"# Source0: keep.tar.xz\n"
+	got := patchSourceArchive(spec)
+	if !strings.Contains(got, "Source0:        %{name}-%{version}.tar.bz2\n") {
+		t.Fatalf("spec Source0 not rewritten:\n%s", got)
+	}
+	if !strings.Contains(got, "Source1:        extra.tar.gz\n") {
+		t.Fatalf("Source1 changed:\n%s", got)
+	}
+	if !strings.Contains(got, "Patch0:         extra.patch\n") {
+		t.Fatalf("Patch0 changed:\n%s", got)
+	}
+	if !strings.Contains(got, "# Source0: keep.tar.xz\n") {
+		t.Fatalf("comment changed:\n%s", got)
+	}
+
+	bare := patchSourceArchive("Source: %{name}-%{version}.tar.xz\n")
+	if bare != "Source: %{name}-%{version}.tar.bz2\n" {
+		t.Fatalf("Source tag: %q", bare)
+	}
+	if got := patchSourceArchive("Source10: %{name}-%{version}.tar.gz\n"); strings.Contains(got, ".tar.bz2") {
+		t.Fatalf("Source10 rewritten: %q", got)
+	}
+	same := "Source0: %{name}-%{version}.tar.bz2\n"
+	if patchSourceArchive(same) != same {
+		t.Fatal("tar.bz2 should stay")
+	}
+
+	yaml := "" +
+		"Name: demo\n" +
+		"Sources:\n" +
+		"    - '%{name}-%{version}.tar.gz'\n" +
+		"    - 'extra.tar.gz'\n" +
+		"Patches:\n" +
+		"    - 'extra.patch'\n"
+	got = patchSourceArchive(yaml)
+	if !strings.Contains(got, "    - '%{name}-%{version}.tar.bz2'\n") {
+		t.Fatalf("yaml Source0 not rewritten:\n%s", got)
+	}
+	if !strings.Contains(got, "    - 'extra.tar.gz'\n") {
+		t.Fatalf("later yaml source changed:\n%s", got)
+	}
+	if !strings.Contains(got, "    - 'extra.patch'\n") {
+		t.Fatalf("yaml patch changed:\n%s", got)
+	}
+
+	for _, suf := range []string{".tgz", ".tar.xz", ".txz", ".tar.zst", ".tar.lzma", ".tbz2", ".zip", ".tar"} {
+		in := "Source0: %{name}-%{version}" + suf + "\n"
+		out := patchSourceArchive(in)
+		want := "Source0: %{name}-%{version}.tar.bz2\n"
+		if out != want {
+			t.Fatalf("%s -> %q", suf, out)
+		}
+	}
+
+	url := patchSourceArchive("Source0: https://example.com/%{name}-%{version}.tar.gz#/%{name}-%{version}.tar.gz\n")
+	if url != "Source0: https://example.com/%{name}-%{version}.tar.gz#/%{name}-%{version}.tar.bz2\n" {
+		t.Fatalf("url local name: %q", url)
+	}
+}
+
 func TestFindPkg(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "rpm"), 0755); err != nil {
@@ -241,6 +308,92 @@ Source3:        https://example.com/upstream.tar.gz
 		if _, err := os.Stat(filepath.Join(top, "SOURCES", name)); err == nil {
 			t.Fatalf("SOURCES should not contain %s", name)
 		}
+	}
+}
+
+func TestPrepareStageRewritesSource0(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "demo-1.0.tar.bz2")
+	if err := os.WriteFile(archive, []byte("bz2"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	yamlDir := filepath.Join(dir, "yaml")
+	if err := os.MkdirAll(yamlDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	yaml := "Name: demo\nVersion: 1.0\nSources:\n- '%{name}-%{version}.tar.gz'\n- 'notes.txt'\n"
+	yamlPath := filepath.Join(yamlDir, "demo.yaml")
+	if err := os.WriteFile(yamlPath, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(yamlDir, "notes.txt"), []byte("notes"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	top, _, cleanup, err := prepareStage(yamlPath, yaml, "demo", "1.0", archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	body, err := os.ReadFile(filepath.Join(top, "rpm", "demo.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "- '%{name}-%{version}.tar.bz2'\n") {
+		t.Fatalf("yaml:\n%s", body)
+	}
+	if strings.Contains(string(body), ".tar.gz") {
+		t.Fatalf("yaml still names gzip:\n%s", body)
+	}
+	if _, err := os.Stat(filepath.Join(top, "SOURCES", "demo-1.0.tar.bz2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(top, "SOURCES", "notes.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	specDir := filepath.Join(dir, "spec")
+	if err := os.MkdirAll(specDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	spec := "Name: ffmpeg\nVersion: 8.1.2\nSource0: %{name}-%{version}.tar.xz\nSource1: enable_decoders\n"
+	specPath := filepath.Join(specDir, "ffmpeg.spec")
+	if err := os.WriteFile(specPath, []byte(spec), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(specDir, "enable_decoders"), []byte("dec"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	top, _, cleanup, err = prepareStage(specPath, spec, "ffmpeg", "8.1.2", archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	body, err = os.ReadFile(filepath.Join(top, "SPECS", "ffmpeg.spec"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "Source0: %{name}-%{version}.tar.bz2\n") {
+		t.Fatalf("spec:\n%s", body)
+	}
+	if _, err := os.Stat(filepath.Join(top, "SOURCES", "enable_decoders")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(top, "SOURCES", "ffmpeg-8.1.2.tar.xz")); err == nil {
+		t.Fatal("should not stage the upstream archive name")
+	}
+
+	// In-place builds do not pack a tarball, so the upstream Source0 name stays.
+	top, _, cleanup, err = prepareStage(specPath, spec, "ffmpeg", "8.1.2", "")
+	if err == nil {
+		cleanup()
+		t.Fatal("in-place should still require the named Source0 file")
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+	if !strings.Contains(err.Error(), "ffmpeg-8.1.2.tar.xz") {
+		t.Fatalf("error %v", err)
 	}
 }
 

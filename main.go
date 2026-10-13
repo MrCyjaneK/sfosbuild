@@ -252,11 +252,12 @@ Architectures: aarch64, armv7hl (armv7a), i486, all
 The project needs rpm/*.yaml (spectacle) or a spec. Every file in the first
 set that exists is built, in name order, so one directory can ship several
 packages. specify runs in the SDK image to generate the spec. build packages
-the git HEAD tree as Source0,
-including submodules already present in the local repository. Source and
-Patch files named by the spec are copied too, when they sit next to the
-spec. The rest of the tree is not. It then runs a
-clean rpmbuild. That container runs with --network=none. SDK image setup
+the git HEAD tree as a .tar.bz2 Source0, including submodules already
+present in the local repository. A spec Source0, or the first Sources
+entry in a yaml, that names another tar compression is rewritten to
+.tar.bz2. Other Source and Patch files named by the spec are copied too,
+when they sit next to the spec. The rest of the tree is not. It then runs
+a clean rpmbuild. That container runs with --network=none. SDK image setup
 and build-requires install still use the network. --in-place and deploy use
 rpmbuild --build-in-place on the working tree. Drop the previous arch's
 build tree first (make clean and make distclean) so that cache is not packaged.
@@ -647,6 +648,97 @@ func patchVersion(spec, version string) string {
 	return strings.Join(lines, "\n")
 }
 
+// source0Line matches a spec Source or Source0 tag, not Source1 and later.
+var source0Line = regexp.MustCompile(`(?i)^(\s*source0?\s*:\s*)(\S+)(.*)$`)
+
+// yamlSourceItem matches the first spectacle Sources list entry.
+var yamlSourceItem = regexp.MustCompile(`^(\s*-\s*)(\S+)(.*)$`)
+
+// archiveSuffixes are Source0 tar compressions other than the .tar.bz2 archive
+// this tool writes. Longest first, so .tar.gz is not treated as .tar.
+var archiveSuffixes = []string{
+	".tar.gz", ".tar.xz", ".tar.zst", ".tar.lzma", ".tar.lz", ".tar.z",
+	".tgz", ".txz", ".tzst", ".tlz", ".tbz2", ".tbz",
+	".zip",
+	".tar",
+}
+
+// rewriteArchiveSuffix changes a Source0 token that names another archive
+// compression to .tar.bz2. Tokens that are already .tar.bz2, or that are not
+// archives, are left alone. Surrounding quotes are preserved.
+func rewriteArchiveSuffix(token string) (string, bool) {
+	quote, body := "", token
+	if len(token) >= 2 {
+		q := token[0]
+		if (q == '\'' || q == '"') && token[len(token)-1] == q {
+			quote = token[:1]
+			body = token[1 : len(token)-1]
+		}
+	}
+	if body == "" {
+		return token, false
+	}
+	lower := strings.ToLower(body)
+	if strings.HasSuffix(lower, ".tar.bz2") {
+		return token, false
+	}
+	for _, suf := range archiveSuffixes {
+		if !strings.HasSuffix(lower, suf) {
+			continue
+		}
+		out := body[:len(body)-len(suf)] + ".tar.bz2"
+		if quote != "" {
+			out = quote + out + quote
+		}
+		return out, true
+	}
+	return token, false
+}
+
+// patchSourceArchive rewrites Source0 to the .tar.bz2 archive writeGitArchive
+// produces. Specs use a Source or Source0 tag. Spectacle yaml uses the first
+// Sources list entry. Later sources and patches are unchanged.
+func patchSourceArchive(meta string) string {
+	lines := strings.Split(meta, "\n")
+	section := ""
+	patchedList := false
+	for i, line := range lines {
+		trim := strings.TrimSpace(line)
+		if trim == "" || strings.HasPrefix(trim, "#") {
+			if trim == "" {
+				section = ""
+			}
+			continue
+		}
+		if m := source0Line.FindStringSubmatch(line); m != nil {
+			if rewritten, ok := rewriteArchiveSuffix(m[2]); ok {
+				lines[i] = m[1] + rewritten + m[3]
+			}
+			section = ""
+			continue
+		}
+		key := strings.TrimSuffix(trim, ":")
+		if !strings.ContainsAny(key, " \t") && strings.EqualFold(key, "sources") {
+			section = "sources"
+			patchedList = false
+			continue
+		}
+		if section == "sources" && strings.HasPrefix(trim, "-") {
+			if !patchedList {
+				patchedList = true
+				if m := yamlSourceItem.FindStringSubmatch(line); m != nil {
+					if rewritten, ok := rewriteArchiveSuffix(m[2]); ok {
+						lines[i] = m[1] + rewritten + m[3]
+					}
+				}
+			}
+			continue
+		}
+		section = ""
+	}
+	return strings.Join(lines, "\n")
+}
+
 func cp(src, dst string) error {
 	data, err := os.ReadFile(src)
 	if err != nil {
@@ -959,6 +1051,13 @@ func prepareStage(pkgPath, meta, name, version, sourceTar string) (topdir, scrip
 	}
 
 	patched := patchVersion(meta, version)
+	if sourceTar != "" {
+		rewritten := patchSourceArchive(patched)
+		if rewritten != patched {
+			log.Printf("Source0 archive set to .tar.bz2")
+		}
+		patched = rewritten
+	}
 	if strings.HasSuffix(pkgPath, ".yaml") {
 		if err := os.MkdirAll(filepath.Join(topdir, "rpm"), 0755); err != nil {
 			cleanup()
