@@ -12,16 +12,16 @@ go install github.com/mrcyjanek/sfosbuild@latest
 
 ```bash
 Usage:
-  sfosbuild [options] <sfos-version> <arch[,arch...]|all> <project>
-  sfosbuild build [options] <sfos-version> <arch[,arch...]|all> <project>
+  sfosbuild [options] <sfos-version> <arch[,arch...]|all> <yaml>
+  sfosbuild build [options] <sfos-version> <arch[,arch...]|all> <yaml>
   sfosbuild shell [options] <sfos-version> <arch> [command...]
-  sfosbuild deploy [options] <user@host> <project>
-  sfosbuild --in-place <sfos-version> <arch> <project>
+  sfosbuild deploy [options] <user@host> <yaml>
+  sfosbuild --in-place <sfos-version> <arch> <yaml>
 ```
 
-`--in-place` is the same working-tree rpmbuild deploy already uses. Run `make clean` and `make distclean` in the project first so a previous architecture's build cache is not packaged.
+The last argument is one spectacle yaml or rpm spec, not the repository directory. A file inside `rpm/` packages the directory that contains `rpm/`. Any other file packages the directory that contains it.
 
-A project can contain more than one `rpm/*.yaml` (or spec). Each file is built, in name order, into the same output directory. Specs are used only when that directory has no yaml. Deploy installs every package it built.
+`--in-place` is the same working-tree rpmbuild deploy already uses. Run `make clean` and `make distclean` in the project first so a previous architecture's build cache is not packaged. Deploy installs the package it built.
 
 ## Hooks
 

@@ -62,21 +62,40 @@ func TestParseArches(t *testing.T) {
 
 func TestParseArgs(t *testing.T) {
 	dir := t.TempDir()
-	cfg, err := parseArgs([]string{"5.1.0.11", "armv7a", dir})
+	yamlPath := filepath.Join(dir, "rpm", "app.yaml")
+	if err := os.MkdirAll(filepath.Dir(yamlPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(yamlPath, []byte("Name: app\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := parseArgs([]string{"5.1.0.11", "armv7a", yamlPath})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Version != "5.1.0.11" || cfg.Arches[0] != "armv7hl" {
 		t.Fatalf("%+v", cfg)
 	}
-	if cfg.Project != dir {
-		t.Fatalf("project %s", cfg.Project)
+	if cfg.Project != dir || cfg.Pkg != yamlPath {
+		t.Fatalf("project %s pkg %s", cfg.Project, cfg.Pkg)
 	}
 	if cfg.Output != filepath.Join(dir, "rpms") {
 		t.Fatalf("output %s", cfg.Output)
 	}
 
-	cfg, err = parseArgs([]string{"-o", "/tmp/rpms", "--rebuild", "5.1.0.11", "aarch64,i486", dir})
+	rootYAML := filepath.Join(dir, "app.yaml")
+	if err := os.WriteFile(rootYAML, []byte("Name: app\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = parseArgs([]string{"5.1.0.11", "aarch64", rootYAML})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Project != dir || cfg.Pkg != rootYAML {
+		t.Fatalf("root yaml project %s pkg %s", cfg.Project, cfg.Pkg)
+	}
+
+	cfg, err = parseArgs([]string{"-o", "/tmp/rpms", "--rebuild", "5.1.0.11", "aarch64,i486", yamlPath})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +103,7 @@ func TestParseArgs(t *testing.T) {
 		t.Fatalf("%+v", cfg)
 	}
 
-	cfg, err = parseArgs([]string{"--in-place", "--source", "5.1.0.11", "aarch64", dir})
+	cfg, err = parseArgs([]string{"--in-place", "--source", "5.1.0.11", "aarch64", yamlPath})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,9 +116,19 @@ func TestParseArgs(t *testing.T) {
 		t.Fatalf("help: %v %v", cfg, err)
 	}
 	if _, err := parseArgs([]string{"5.1.0.11", "aarch64"}); err == nil {
-		t.Fatal("expected missing project")
+		t.Fatal("expected missing yaml")
 	}
-	if _, err := parseArgs([]string{"--nope", "5.1.0.11", "all", dir}); err == nil {
+	if _, err := parseArgs([]string{"5.1.0.11", "aarch64", dir}); err == nil {
+		t.Fatal("expected a directory to fail")
+	}
+	notes := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(notes, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseArgs([]string{"5.1.0.11", "aarch64", notes}); err == nil {
+		t.Fatal("expected a non-yaml file to fail")
+	}
+	if _, err := parseArgs([]string{"--nope", "5.1.0.11", "all", yamlPath}); err == nil {
 		t.Fatal("expected unknown flag")
 	}
 }
@@ -190,36 +219,38 @@ func TestPatchSourceArchive(t *testing.T) {
 	}
 }
 
-func TestFindPkg(t *testing.T) {
+func TestResolveTarget(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "rpm"), 0755); err != nil {
+	yamlPath := filepath.Join(dir, "rpm", "reversegearhead.yaml")
+	if err := os.MkdirAll(filepath.Dir(yamlPath), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "rpm", "reversegearhead.yaml"), []byte("Name: reversegearhead\n"), 0644); err != nil {
+	if err := os.WriteFile(yamlPath, []byte("Name: reversegearhead\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	p, err := findPkgs(dir)
+	project, pkg, err := resolveTarget(yamlPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p) != 1 || filepath.Base(p[0]) != "reversegearhead.yaml" {
-		t.Fatalf("got %v", p)
+	if project != dir || pkg != yamlPath {
+		t.Fatalf("project %s pkg %s", project, pkg)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "rpm", "a.yaml"), []byte("Name: a\n"), 0644); err != nil {
+	specPath := filepath.Join(dir, "app.spec")
+	if err := os.WriteFile(specPath, []byte("Name: app\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "ignored.spec"), []byte("Name: no\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	p, err = findPkgs(dir)
+	project, pkg, err = resolveTarget(specPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p) != 2 || filepath.Base(p[0]) != "a.yaml" || filepath.Base(p[1]) != "reversegearhead.yaml" {
-		t.Fatalf("got %v", p)
+	if project != dir || pkg != specPath {
+		t.Fatalf("spec project %s pkg %s", project, pkg)
 	}
-	if _, err := findPkgs(t.TempDir()); err == nil {
-		t.Fatal("expected missing yaml")
+	if _, _, err := resolveTarget(dir); err == nil {
+		t.Fatal("expected a directory to fail")
+	}
+	if _, _, err := resolveTarget(filepath.Join(dir, "missing.yaml")); err == nil {
+		t.Fatal("expected a missing file to fail")
 	}
 }
 
@@ -949,21 +980,31 @@ func TestDockerShellArgs(t *testing.T) {
 
 func TestParseDeployArgs(t *testing.T) {
 	dir := t.TempDir()
-	cfg, host, err := parseDeployArgs([]string{"defaultuser@192.168.1.177", dir})
+	yamlPath := filepath.Join(dir, "rpm", "app.yaml")
+	if err := os.MkdirAll(filepath.Dir(yamlPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(yamlPath, []byte("Name: app\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, host, err := parseDeployArgs([]string{"defaultuser@192.168.1.177", yamlPath})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if host != "defaultuser@192.168.1.177" || cfg.Project != dir {
+	if host != "defaultuser@192.168.1.177" || cfg.Project != dir || cfg.Pkg != yamlPath {
 		t.Fatalf("%q %+v", host, cfg)
 	}
 	if cfg.Output != filepath.Join(dir, "rpms") {
 		t.Fatalf("output %s", cfg.Output)
 	}
-	if _, _, err := parseDeployArgs([]string{"nohost", dir}); err == nil {
+	if _, _, err := parseDeployArgs([]string{"nohost", yamlPath}); err == nil {
 		t.Fatal("expected user@host error")
 	}
 	if _, _, err := parseDeployArgs([]string{"user@host"}); err == nil {
-		t.Fatal("expected missing project")
+		t.Fatal("expected missing yaml")
+	}
+	if _, _, err := parseDeployArgs([]string{"user@host", dir}); err == nil {
+		t.Fatal("expected a directory to fail")
 	}
 }
 

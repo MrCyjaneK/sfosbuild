@@ -42,7 +42,8 @@ var archPlatform = map[string]string{
 type config struct {
 	Version     string
 	Arches      []string
-	Project     string
+	Project     string // directory whose tree is packaged
+	Pkg         string // spectacle yaml or spec to build
 	Output      string
 	Rebuild     bool
 	InPlace     bool // working tree via rpmbuild --build-in-place; otherwise git archive of HEAD and local submodules
@@ -84,10 +85,6 @@ func runBuild(cfg *config) error {
 	if err := withWorkspace(cfg); err != nil {
 		return err
 	}
-	pkgs, err := findPkgs(cfg.Project)
-	if err != nil {
-		return err
-	}
 	if err := os.MkdirAll(cfg.Output, 0755); err != nil {
 		return err
 	}
@@ -95,10 +92,8 @@ func runBuild(cfg *config) error {
 	if err != nil {
 		return err
 	}
-	for _, pkgPath := range pkgs {
-		if err := buildPkg(cfg, pkgPath, outAbs); err != nil {
-			return err
-		}
+	if err := buildPkg(cfg, cfg.Pkg, outAbs); err != nil {
+		return err
 	}
 	log.Printf("rpms in %s", outAbs)
 	return nil
@@ -167,34 +162,28 @@ func runDeploy(args []string) error {
 	if err != nil {
 		return err
 	}
-	pkgs, err := findPkgs(cfg.Project)
+	meta, err := os.ReadFile(cfg.Pkg)
 	if err != nil {
 		return err
 	}
-	for _, pkgPath := range pkgs {
-		meta, err := os.ReadFile(pkgPath)
-		if err != nil {
+	pkgName := specField(string(meta), "Name")
+	if pkgName == "" {
+		return fmt.Errorf("no Name: in %s", cfg.Pkg)
+	}
+	pkgVersion := os.Getenv("RPM_VERSION")
+	if pkgVersion == "" {
+		pkgVersion = specField(string(meta), "Version")
+	}
+	if pkgVersion == "" {
+		return fmt.Errorf("no Version: in %s (or RPM_VERSION)", cfg.Pkg)
+	}
+	rpms, err := findDeployRPMs(outAbs, pkgName, pkgVersion, arch)
+	if err != nil {
+		return err
+	}
+	for _, rpm := range rpms {
+		if err := installRPM(userHost, rpm); err != nil {
 			return err
-		}
-		pkgName := specField(string(meta), "Name")
-		if pkgName == "" {
-			return fmt.Errorf("no Name: in %s", pkgPath)
-		}
-		pkgVersion := os.Getenv("RPM_VERSION")
-		if pkgVersion == "" {
-			pkgVersion = specField(string(meta), "Version")
-		}
-		if pkgVersion == "" {
-			return fmt.Errorf("no Version: in %s (or RPM_VERSION)", pkgPath)
-		}
-		rpms, err := findDeployRPMs(outAbs, pkgName, pkgVersion, arch)
-		if err != nil {
-			return err
-		}
-		for _, rpm := range rpms {
-			if err := installRPM(userHost, rpm); err != nil {
-				return err
-			}
 		}
 	}
 	return nil
@@ -202,10 +191,10 @@ func runDeploy(args []string) error {
 
 func usage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
-  sfosbuild [options] <sfos-version> <arch[,arch...]|all> <project>
-  sfosbuild build [options] <sfos-version> <arch[,arch...]|all> <project>
+  sfosbuild [options] <sfos-version> <arch[,arch...]|all> <yaml>
+  sfosbuild build [options] <sfos-version> <arch[,arch...]|all> <yaml>
   sfosbuild shell [options] <sfos-version> <arch> [command...]
-  sfosbuild deploy [options] <user@host> <project>
+  sfosbuild deploy [options] <user@host> <yaml>
 
 Build Sailfish OS RPMs, deploy to a device, or open a shell in SDK target containers.
 
@@ -231,12 +220,12 @@ Commands:
                    No command -> interactive sh -i. Rebuilds the image if hooks changed.
 
 Examples:
-  sfosbuild 5.1.0.11 aarch64 ./my_sfos_source
-  sfosbuild 5.1.0.11 all ./my_sfos_source
+  sfosbuild 5.1.0.11 aarch64 ./my_sfos_source/rpm/app.yaml
+  sfosbuild 5.1.0.11 all ./my_sfos_source/rpm/app.yaml
   sfosbuild shell 5.1.0.11 aarch64
   sfosbuild shell 5.1.0.11 i486 uname -m
   sfosbuild shell 5.1.0.11 i486 sh -c 'pwd; ls'
-  sfosbuild deploy defaultuser@192.168.1.177 ./my_sfos_source
+  sfosbuild deploy defaultuser@192.168.1.177 ./my_sfos_source/rpm/app.yaml
 
 Options:
   -o, --output DIR     RPM output directory (default: <project>/rpms)
@@ -249,10 +238,10 @@ Options:
 Architectures: aarch64, armv7hl (armv7a), i486, all
   shell takes a single arch (not all).
 
-The project needs rpm/*.yaml (spectacle) or a spec. Every file in the first
-set that exists is built, in name order, so one directory can ship several
-packages. specify runs in the SDK image to generate the spec. build packages
-the git HEAD tree as a .tar.bz2 Source0, including submodules already
+The last argument is one spectacle yaml or rpm spec. A file inside rpm/
+packages the directory that contains rpm/. Any other file packages the
+directory that contains it. specify runs in the SDK image to generate the
+spec. build packages the git HEAD tree as a .tar.bz2 Source0, including submodules already
 present in the local repository. A spec Source0, or the first Sources
 entry in a yaml, that names another tar compression is rewritten to
 .tar.bz2. Other Source and Patch files named by the spec are copied too,
@@ -312,7 +301,7 @@ func parseArgs(args []string) (*config, error) {
 	}
 	if len(pos) != 3 {
 		usage(os.Stderr)
-		return nil, fmt.Errorf("want: <sfos-version> <arch|all> <project>")
+		return nil, fmt.Errorf("want: <sfos-version> <arch|all> <yaml>")
 	}
 	cfg.Version = pos[0]
 	arches, err := parseArches(pos[1])
@@ -320,22 +309,42 @@ func parseArgs(args []string) (*config, error) {
 		return nil, err
 	}
 	cfg.Arches = arches
-	abs, err := filepath.Abs(pos[2])
+	project, pkg, err := resolveTarget(pos[2])
 	if err != nil {
 		return nil, err
+	}
+	cfg.Project = project
+	cfg.Pkg = pkg
+	if cfg.Output == "" {
+		cfg.Output = filepath.Join(project, "rpms")
+	}
+	return cfg, nil
+}
+
+// resolveTarget requires a spectacle yaml or rpm spec. The project directory
+// is the parent of rpm/ when the file lives there, otherwise the file's directory.
+func resolveTarget(path string) (project, pkg string, err error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", err
 	}
 	st, err := os.Stat(abs)
 	if err != nil {
-		return nil, err
+		return "", "", err
 	}
-	if !st.IsDir() {
-		return nil, fmt.Errorf("not a directory: %s", abs)
+	if st.IsDir() {
+		return "", "", fmt.Errorf("%s is a directory; pass the yaml or spec file to build", abs)
 	}
-	cfg.Project = abs
-	if cfg.Output == "" {
-		cfg.Output = filepath.Join(abs, "rpms")
+	switch strings.ToLower(filepath.Ext(abs)) {
+	case ".yaml", ".spec":
+	default:
+		return "", "", fmt.Errorf("%s must be a .yaml or .spec file", abs)
 	}
-	return cfg, nil
+	dir := filepath.Dir(abs)
+	if filepath.Base(dir) == "rpm" {
+		dir = filepath.Dir(dir)
+	}
+	return dir, abs, nil
 }
 
 func parseDeployArgs(args []string) (*config, string, error) {
@@ -345,26 +354,20 @@ func parseDeployArgs(args []string) (*config, string, error) {
 	}
 	if len(pos) != 2 {
 		usage(os.Stderr)
-		return nil, "", fmt.Errorf("want: sfosbuild deploy <user@host> <project>")
+		return nil, "", fmt.Errorf("want: sfosbuild deploy <user@host> <yaml>")
 	}
 	userHost := pos[0]
 	if !strings.Contains(userHost, "@") {
 		return nil, "", fmt.Errorf("want user@host, got %q", userHost)
 	}
-	abs, err := filepath.Abs(pos[1])
+	project, pkg, err := resolveTarget(pos[1])
 	if err != nil {
 		return nil, "", err
 	}
-	st, err := os.Stat(abs)
-	if err != nil {
-		return nil, "", err
-	}
-	if !st.IsDir() {
-		return nil, "", fmt.Errorf("not a directory: %s", abs)
-	}
-	cfg.Project = abs
+	cfg.Project = project
+	cfg.Pkg = pkg
 	if cfg.Output == "" {
-		cfg.Output = filepath.Join(abs, "rpms")
+		cfg.Output = filepath.Join(project, "rpms")
 	}
 	return cfg, userHost, nil
 }
@@ -585,26 +588,6 @@ func buildDepsHash(meta, version, baseID string) string {
 	h.Write([]byte(patchVersion(meta, version)))
 	h.Write([]byte(baseID))
 	return hex.EncodeToString(h.Sum(nil))[:16]
-}
-
-func findPkgs(project string) ([]string, error) {
-	for _, g := range []string{
-		filepath.Join(project, "rpm", "*.yaml"),
-		filepath.Join(project, "*.yaml"),
-		filepath.Join(project, "rpm", "*.spec"),
-		filepath.Join(project, "*.spec"),
-	} {
-		matches, err := filepath.Glob(g)
-		if err != nil {
-			return nil, err
-		}
-		if len(matches) == 0 {
-			continue
-		}
-		sort.Strings(matches)
-		return matches, nil
-	}
-	return nil, fmt.Errorf("no rpm/*.yaml in %s", project)
 }
 
 func specField(spec, field string) string {
