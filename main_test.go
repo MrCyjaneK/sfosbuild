@@ -111,6 +111,14 @@ func TestParseArgs(t *testing.T) {
 		t.Fatal("expected in-place and source")
 	}
 
+	cfg, err = parseArgs([]string{"--network", "5.1.0.11", "aarch64", yamlPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Network {
+		t.Fatal("expected network")
+	}
+
 	cfg, err = parseArgs([]string{"--help"})
 	if err != nil || cfg != nil {
 		t.Fatalf("help: %v %v", cfg, err)
@@ -703,7 +711,7 @@ func TestDockerArgs(t *testing.T) {
 		}
 	}
 
-	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/cache/m_root", "/home/user", true, true)
+	run := dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/cache/m_root", "/home/user", true, true, false)
 	joined = strings.Join(run, " ")
 	for _, want := range []string{
 		"run --rm",
@@ -729,12 +737,20 @@ func TestDockerArgs(t *testing.T) {
 		t.Fatalf("output directory must not be bind-mounted: %s", joined)
 	}
 
-	clean := strings.Join(dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/cache/m_root", "/home/user", false, false), " ")
+	clean := strings.Join(dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/cache/m_root", "/home/user", false, false, false), " ")
 	if strings.Contains(clean, "/proj:/build") || strings.Contains(clean, "SFOS_INPLACE") || strings.Contains(clean, "SFOS_SOURCE") {
 		t.Fatalf("clean build should not mount the project: %s", clean)
 	}
 	if !strings.Contains(clean, "-w /rpmbuild") {
 		t.Fatalf("missing rpmbuild workdir in %s", clean)
+	}
+	if !strings.Contains(clean, "--network none") {
+		t.Fatalf("clean build should isolate the network: %s", clean)
+	}
+
+	online := strings.Join(dockerRunArgs("sfosbuild:5.1.0.11-i486", "linux/386", "i486", "/proj", "/top", "/script.sh", "/cache/m_root", "/home/user", false, false, true), " ")
+	if strings.Contains(online, "--network") {
+		t.Fatalf("--network should use the default docker network: %s", online)
 	}
 }
 
@@ -1147,6 +1163,8 @@ func TestUsage(t *testing.T) {
 		"sfosbuild deploy",
 		"--in-place",
 		"--source",
+		"--network",
+		"unless --network",
 		"device ~/.sfosbuild-os-version",
 		"--network=none",
 		"<prefix>_<workspace>",

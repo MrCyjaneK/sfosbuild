@@ -48,6 +48,7 @@ type config struct {
 	Rebuild     bool
 	InPlace     bool // working tree via rpmbuild --build-in-place; otherwise git archive of HEAD and local submodules
 	Source      bool // rpmbuild -ba and copy SRPMS into the output directory
+	Network     bool // rpmbuild container uses the default docker network; otherwise --network=none
 	ImagePrefix string
 	Root        string // $wd: directory that contains .sfosbuild/
 	WorkDir     string // host cwd, used as docker -w
@@ -231,6 +232,7 @@ Options:
   -o, --output DIR     RPM output directory (default: <project>/rpms)
   --in-place           rpmbuild --build-in-place on the working tree
   --source             also build the .src.rpm and copy SRPMS to the output directory
+  --network            let the rpmbuild container reach the internet
   --rebuild            rebuild SDK images even if they exist
   --image-prefix NAME  docker image prefix (default: sfosbuild)
   -h, --help           show this help
@@ -246,8 +248,9 @@ present in the local repository. A spec Source0, or the first Sources
 entry in a yaml, that names another tar compression is rewritten to
 .tar.bz2. Other Source and Patch files named by the spec are copied too,
 when they sit next to the spec. The rest of the tree is not. It then runs
-a clean rpmbuild. That container runs with --network=none. SDK image setup
-and build-requires install still use the network. --in-place and deploy use
+a clean rpmbuild. That container runs with --network=none unless --network
+is set. SDK image setup and build-requires install still use the network.
+--in-place and deploy use
 rpmbuild --build-in-place on the working tree. Drop the previous arch's
 build tree first (make clean and make distclean) so that cache is not packaged.
 Images are tagged <prefix>_<workspace>:<version>-<arch>, where
@@ -271,6 +274,8 @@ func parseFlags(args []string) (*config, []string, error) {
 			cfg.InPlace = true
 		case a == "--source":
 			cfg.Source = true
+		case a == "--network":
+			cfg.Network = true
 		case a == "--rebuild":
 			cfg.Rebuild = true
 		case a == "-o" || a == "--output":
@@ -1350,7 +1355,7 @@ func buildArch(cfg *config, arch, pkgPath, meta, name, version, out, sourceTar s
 	if err != nil {
 		return err
 	}
-	args := dockerRunArgs(tag, archPlatform[arch], arch, cfg.Project, topdir, script, merRoot, home, cfg.InPlace, cfg.Source)
+	args := dockerRunArgs(tag, archPlatform[arch], arch, cfg.Project, topdir, script, merRoot, home, cfg.InPlace, cfg.Source, cfg.Network)
 	if err := runCmd(dockerCmd(args...)); err != nil {
 		return fmt.Errorf("docker run: %w", err)
 	}
@@ -1395,18 +1400,22 @@ func publishRPMs(topdir, out string, source bool) error {
 	return nil
 }
 
-func dockerRunArgs(tag, platform, arch, project, topdir, script, merRoot, home string, inPlace, source bool) []string {
+func dockerRunArgs(tag, platform, arch, project, topdir, script, merRoot, home string, inPlace, source, network bool) []string {
 	workdir := "/rpmbuild"
 	args := []string{
 		"run", "--rm",
-		"--network", "none",
+	}
+	if !network {
+		args = append(args, "--network", "none")
+	}
+	args = append(args,
 		"--label", dockerRunLabel,
 		"--platform", platform,
-		"-e", "SFOS_ARCH=" + arch,
-		"-e", "HOST_UID=" + strconv.Itoa(os.Getuid()),
-		"-e", "HOST_GID=" + strconv.Itoa(os.Getgid()),
-		"-v", home + ":" + home + ":ro",
-	}
+		"-e", "SFOS_ARCH="+arch,
+		"-e", "HOST_UID="+strconv.Itoa(os.Getuid()),
+		"-e", "HOST_GID="+strconv.Itoa(os.Getgid()),
+		"-v", home+":"+home+":ro",
+	)
 	if inPlace {
 		workdir = "/build"
 		args = append(args,
