@@ -875,7 +875,8 @@ func appendSubmodules(tw *tar.Writer, workTree, gitDir, tree, prefix string, see
 			return err
 		}
 		if _, err := gitOutputOpt("", subGit, "cat-file", "-e", link.sha+"^{commit}"); err != nil {
-			return fmt.Errorf("submodule %s commit %s is not present locally", full, link.sha)
+			log.Printf("submodule %s commit %s is not present locally; skipping", full, link.sha)
+			continue
 		}
 		log.Printf("submodule %s", full)
 		if err := archiveTree(tw, "", subGit, link.sha, prefix+link.path+"/", seen); err != nil {

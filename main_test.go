@@ -652,6 +652,70 @@ func TestGitArchiveSubmodules(t *testing.T) {
 	}
 }
 
+func TestGitArchiveSkipsMissingSubmodule(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+	t.Setenv("GIT_CONFIG_VALUE_0", "always")
+
+	root := t.TempDir()
+	leaf := filepath.Join(root, "leaf")
+	parent := filepath.Join(root, "parent")
+	git := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git -C %s %v: %s", dir, args, out)
+		}
+	}
+	initRepo := func(dir string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		git(dir, "init", "-q")
+	}
+
+	initRepo(leaf)
+	if err := os.WriteFile(filepath.Join(leaf, "leaf.txt"), []byte("leaf\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git(leaf, "add", "leaf.txt")
+	git(leaf, "commit", "-qm", "leaf")
+
+	initRepo(parent)
+	if err := os.WriteFile(filepath.Join(parent, "top.txt"), []byte("top\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git(parent, "add", "top.txt")
+	git(parent, "commit", "-qm", "top")
+	git(parent, "submodule", "add", "--", leaf, "vendor")
+	git(parent, "commit", "-qm", "add-vendor")
+
+	modules := filepath.Join(parent, ".git", "modules", "vendor")
+	if err := os.RemoveAll(modules); err != nil {
+		t.Fatal(err)
+	}
+
+	tarPath, cleanup, err := writeGitArchive(parent, "demo", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	files := tarFiles(t, tarPath)
+	if files["demo-1.0/top.txt"] != "top\n" {
+		t.Fatalf("top.txt: %q", files["demo-1.0/top.txt"])
+	}
+	if _, ok := files["demo-1.0/vendor/leaf.txt"]; ok {
+		t.Fatal("archive includes a submodule whose commit is not local")
+	}
+}
+
 func rewriteGitmodulesURL(t *testing.T, path, from, to string) {
 	t.Helper()
 	data, err := os.ReadFile(path)
