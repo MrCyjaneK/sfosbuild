@@ -243,8 +243,10 @@ Architectures: aarch64, armv7hl (armv7a), i486, all
 The last argument is one spectacle yaml or rpm spec. A file inside rpm/
 packages the directory that contains rpm/. Any other file packages the
 directory that contains it. specify runs in the SDK image to generate the
-spec. build packages the git HEAD tree as a .tar.bz2 Source0, including submodules already
-present in the local repository. A spec Source0, or the first Sources
+spec. build packages the git HEAD tree as a .tar.bz2 Source0. Submodule
+commits recorded in that tree are packed too. A commit that is not in the
+local module git dir is fetched. update=none in .gitmodules is ignored, so
+a clean clone still packs those submodules. A spec Source0, or the first Sources
 entry in a yaml, that names another tar compression is rewritten to
 .tar.bz2. Other Source and Patch files named by the spec are copied too,
 when they sit next to the spec. The rest of the tree is not. It then runs
@@ -789,8 +791,8 @@ func writeGitArchive(project, name, version string) (path string, cleanup func()
 }
 
 // archiveTree packs tree and any gitlinks it records. Submodule contents come
-// from the local module git dir (.git/modules/...). Nothing is fetched or
-// checked out.
+// from the module git dir (.git/modules/...). A recorded commit that is not
+// there yet is fetched. update=none does not skip that fetch.
 func archiveTree(tw *tar.Writer, workTree, gitDir, tree, prefix string, seen map[string]bool) error {
 	key := workTree + "\x00" + gitDir + "\x00" + tree
 	if seen[key] {
@@ -875,8 +877,20 @@ func appendSubmodules(tw *tar.Writer, workTree, gitDir, tree, prefix string, see
 			return err
 		}
 		if _, err := gitOutputOpt("", subGit, "cat-file", "-e", link.sha+"^{commit}"); err != nil {
-			log.Printf("submodule %s commit %s is not present locally; skipping", full, link.sha)
-			continue
+			log.Printf("submodule %s commit %s is not present locally; fetching", full, link.sha)
+			if ferr := fetchSubmodule(workTree, gitDir, full); ferr != nil {
+				log.Printf("submodule %s: %v", full, ferr)
+				log.Printf("submodule %s commit %s is not present locally; skipping", full, link.sha)
+				continue
+			}
+			subGit, err = submoduleGitDir(workTree, gitDir, name)
+			if err != nil {
+				return err
+			}
+			if _, err := gitOutputOpt("", subGit, "cat-file", "-e", link.sha+"^{commit}"); err != nil {
+				log.Printf("submodule %s commit %s is not present locally; skipping", full, link.sha)
+				continue
+			}
 		}
 		log.Printf("submodule %s", full)
 		if err := archiveTree(tw, "", subGit, link.sha, prefix+link.path+"/", seen); err != nil {
@@ -944,6 +958,28 @@ func parseGitmodules(data string) map[string]string {
 	}
 	flush()
 	return pathToName
+}
+
+// fetchSubmodule clones path at the commit the superproject records.
+// --checkout overrides update=none. Children are fetched later, when their
+// own gitlinks are packed, so one unreachable submodule does not abort the rest.
+func fetchSubmodule(workTree, gitDir, path string) error {
+	dir := workTree
+	if dir == "" {
+		var err error
+		dir, err = gitOutputOpt("", gitDir, "rev-parse", "--show-toplevel")
+		if err != nil {
+			return err
+		}
+	}
+	cmd := exec.Command("git", "-C", dir, "-c", "submodule.recurse=false",
+		"submodule", "update", "--init", "--checkout", "--depth", "1", "--", path)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("fetch: %w", err)
+	}
+	return nil
 }
 
 func submoduleGitDir(workTree, gitDir, name string) (string, error) {

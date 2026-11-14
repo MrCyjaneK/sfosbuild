@@ -652,7 +652,7 @@ func TestGitArchiveSubmodules(t *testing.T) {
 	}
 }
 
-func TestGitArchiveSkipsMissingSubmodule(t *testing.T) {
+func TestGitArchiveFetchesMissingSubmodule(t *testing.T) {
 	t.Setenv("GIT_CONFIG_COUNT", "1")
 	t.Setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
 	t.Setenv("GIT_CONFIG_VALUE_0", "always")
@@ -696,8 +696,162 @@ func TestGitArchiveSkipsMissingSubmodule(t *testing.T) {
 	git(parent, "submodule", "add", "--", leaf, "vendor")
 	git(parent, "commit", "-qm", "add-vendor")
 
-	modules := filepath.Join(parent, ".git", "modules", "vendor")
-	if err := os.RemoveAll(modules); err != nil {
+	// Not checked out, as on a clean clone: no module git dir and no work tree.
+	if err := os.RemoveAll(filepath.Join(parent, ".git", "modules", "vendor")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(parent, "vendor")); err != nil {
+		t.Fatal(err)
+	}
+
+	tarPath, cleanup, err := writeGitArchive(parent, "demo", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	files := tarFiles(t, tarPath)
+	if files["demo-1.0/top.txt"] != "top\n" {
+		t.Fatalf("top.txt: %q", files["demo-1.0/top.txt"])
+	}
+	if files["demo-1.0/vendor/leaf.txt"] != "leaf\n" {
+		t.Fatalf("leaf.txt: %q", files["demo-1.0/vendor/leaf.txt"])
+	}
+}
+
+func TestGitArchiveUpdateNone(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+	t.Setenv("GIT_CONFIG_VALUE_0", "always")
+
+	root := t.TempDir()
+	leaf := filepath.Join(root, "leaf")
+	mid := filepath.Join(root, "mid")
+	parent := filepath.Join(root, "parent")
+	git := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git -C %s %v: %s", dir, args, out)
+		}
+	}
+	initRepo := func(dir string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		git(dir, "init", "-q")
+	}
+
+	initRepo(leaf)
+	if err := os.WriteFile(filepath.Join(leaf, "leaf.txt"), []byte("leaf\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git(leaf, "add", "leaf.txt")
+	git(leaf, "commit", "-qm", "leaf")
+
+	initRepo(mid)
+	if err := os.WriteFile(filepath.Join(mid, "mid.txt"), []byte("mid\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git(mid, "add", "mid.txt")
+	git(mid, "commit", "-qm", "mid")
+	git(mid, "submodule", "add", "--", leaf, "nested")
+	data, err := os.ReadFile(filepath.Join(mid, ".gitmodules"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mid, ".gitmodules"), append(data, []byte("\tupdate = none\n")...), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git(mid, "add", ".gitmodules")
+	git(mid, "commit", "-qm", "update-none")
+
+	initRepo(parent)
+	if err := os.WriteFile(filepath.Join(parent, "top.txt"), []byte("top\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git(parent, "add", "top.txt")
+	git(parent, "commit", "-qm", "top")
+	git(parent, "submodule", "add", "--", mid, "vendor")
+	git(parent, "commit", "-qm", "add-vendor")
+
+	// A recursive update stops at update=none. The archive fetch must not.
+	nestedModules := filepath.Join(parent, ".git", "modules", "vendor", "modules")
+	if err := os.RemoveAll(nestedModules); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(parent, "vendor", "nested")); err != nil {
+		t.Fatal(err)
+	}
+
+	tarPath, cleanup, err := writeGitArchive(parent, "demo", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	files := tarFiles(t, tarPath)
+	if files["demo-1.0/vendor/mid.txt"] != "mid\n" {
+		t.Fatalf("mid.txt: %q", files["demo-1.0/vendor/mid.txt"])
+	}
+	if files["demo-1.0/vendor/nested/leaf.txt"] != "leaf\n" {
+		t.Fatalf("leaf.txt: %q", files["demo-1.0/vendor/nested/leaf.txt"])
+	}
+}
+
+func TestGitArchiveSkipsUnreachableSubmodule(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+	t.Setenv("GIT_CONFIG_VALUE_0", "always")
+
+	root := t.TempDir()
+	leaf := filepath.Join(root, "leaf")
+	parent := filepath.Join(root, "parent")
+	git := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git -C %s %v: %s", dir, args, out)
+		}
+	}
+	initRepo := func(dir string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		git(dir, "init", "-q")
+	}
+
+	initRepo(leaf)
+	if err := os.WriteFile(filepath.Join(leaf, "leaf.txt"), []byte("leaf\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git(leaf, "add", "leaf.txt")
+	git(leaf, "commit", "-qm", "leaf")
+
+	initRepo(parent)
+	if err := os.WriteFile(filepath.Join(parent, "top.txt"), []byte("top\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git(parent, "add", "top.txt")
+	git(parent, "commit", "-qm", "top")
+	git(parent, "submodule", "add", "--", leaf, "vendor")
+	rewriteGitmodulesURL(t, filepath.Join(parent, ".gitmodules"), leaf, "https://127.0.0.1:1/leaf.git")
+	git(parent, "add", ".gitmodules")
+	git(parent, "commit", "-qm", "dead-url")
+	git(parent, "submodule", "deinit", "-f", "vendor")
+	if err := os.RemoveAll(filepath.Join(parent, ".git", "modules", "vendor")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -712,7 +866,7 @@ func TestGitArchiveSkipsMissingSubmodule(t *testing.T) {
 		t.Fatalf("top.txt: %q", files["demo-1.0/top.txt"])
 	}
 	if _, ok := files["demo-1.0/vendor/leaf.txt"]; ok {
-		t.Fatal("archive includes a submodule whose commit is not local")
+		t.Fatal("archive includes a submodule whose commit could not be fetched")
 	}
 }
 
