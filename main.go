@@ -49,6 +49,7 @@ type config struct {
 	InPlace     bool // working tree via rpmbuild --build-in-place; otherwise git archive of HEAD and local submodules
 	Source      bool // rpmbuild -ba and copy SRPMS into the output directory
 	Network     bool // rpmbuild container uses the default docker network; otherwise --network=none
+	Stamp       bool // append .<committer time>.<rev-list count> to Release
 	ImagePrefix string
 	Root        string // $wd: directory that contains .sfosbuild/
 	WorkDir     string // host cwd, used as docker -w
@@ -117,6 +118,18 @@ func buildPkg(cfg *config, pkgPath, outAbs string) error {
 	if version == "" {
 		return fmt.Errorf("no Version: in %s (or RPM_VERSION)", pkgPath)
 	}
+	var releaseSuffix string
+	if cfg.Stamp {
+		releaseSuffix, err = releaseStamp(cfg.Project)
+		if err != nil {
+			return err
+		}
+		stamped, err := patchRelease(text, releaseSuffix)
+		if err != nil {
+			return fmt.Errorf("no Release: in %s", pkgPath)
+		}
+		log.Printf("release %s", specField(stamped, "Release"))
+	}
 	var sourceTar string
 	if !cfg.InPlace {
 		tarPath, tarCleanup, err := writeGitArchive(cfg.Project, name, version)
@@ -129,7 +142,7 @@ func buildPkg(cfg *config, pkgPath, outAbs string) error {
 	}
 	for _, arch := range cfg.Arches {
 		log.Printf("%s %s %s", cfg.Version, arch, name)
-		if err := buildArch(cfg, arch, pkgPath, text, name, version, outAbs, sourceTar); err != nil {
+		if err := buildArch(cfg, arch, pkgPath, text, name, version, outAbs, sourceTar, releaseSuffix); err != nil {
 			return fmt.Errorf("%s: %w", arch, err)
 		}
 	}
@@ -234,6 +247,7 @@ Options:
   --source             also build the .src.rpm and copy SRPMS to the output directory
   --network            let the rpmbuild container reach the internet
   --rebuild            rebuild SDK images even if they exist
+  --stamp              append .<committer time>.<rev-list count> to Release
   --image-prefix NAME  docker image prefix (default: sfosbuild)
   -h, --help           show this help
 
@@ -280,6 +294,8 @@ func parseFlags(args []string) (*config, []string, error) {
 			cfg.Network = true
 		case a == "--rebuild":
 			cfg.Rebuild = true
+		case a == "--stamp":
+			cfg.Stamp = true
 		case a == "-o" || a == "--output":
 			if i+1 >= len(args) {
 				return nil, nil, fmt.Errorf("%s needs an argument", a)
@@ -636,6 +652,74 @@ func patchVersion(spec, version string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// releaseStamp is .<YYYYMMDDHHMMSS>.<count> without the leading dot.
+// The time is the committer time of the chosen commit, in UTC. The count is
+// git rev-list --count of that same commit. SFOSBUILD_RELEASE_COMMIT selects
+// it; otherwise the commit is HEAD.
+func releaseStamp(project string) (string, error) {
+	shallow, err := gitOutput(project, "rev-parse", "--is-shallow-repository")
+	if err != nil {
+		return "", err
+	}
+	if shallow == "true" {
+		return "", fmt.Errorf("%s is a shallow git repository", project)
+	}
+	rev := os.Getenv("SFOSBUILD_RELEASE_COMMIT")
+	if rev == "" {
+		rev = "HEAD"
+	}
+	commit, err := gitOutput(project, "rev-parse", "--verify", rev+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("release commit %s: %w", rev, err)
+	}
+	ts, err := gitOutput(project, "log", "-1", "--format=%ct", commit)
+	if err != nil {
+		return "", err
+	}
+	sec, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("commit time %q: %w", ts, err)
+	}
+	when := time.Unix(sec, 0).UTC().Format("20060102150405")
+	count, err := gitOutput(project, "rev-list", "--count", commit)
+	if err != nil {
+		return "", err
+	}
+	if count == "" {
+		return "", fmt.Errorf("empty rev-list count for %s", commit)
+	}
+	return when + "." + count, nil
+}
+
+// patchRelease appends .<suffix> to every Release tag. Comment lines and
+// changelog prose are left alone. A spec with no Release tag is an error.
+func patchRelease(spec, suffix string) (string, error) {
+	lines := strings.Split(spec, "\n")
+	found := false
+	for i, line := range lines {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, "#") {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(trim), "release:") {
+			continue
+		}
+		idx := strings.Index(strings.ToLower(line), "release:")
+		rest := line[idx+len("release:"):]
+		val := strings.TrimSpace(rest)
+		if val == "" {
+			continue
+		}
+		pad := rest[:len(rest)-len(strings.TrimLeft(rest, " \t"))]
+		lines[i] = line[:idx+len("release:")] + pad + val + "." + suffix
+		found = true
+	}
+	if !found {
+		return "", fmt.Errorf("no Release:")
+	}
+	return strings.Join(lines, "\n"), nil
 }
 
 // source0Line matches a spec Source or Source0 tag, not Source1 and later.
@@ -1055,7 +1139,7 @@ func gitOutput(dir string, args ...string) (string, error) {
 	return gitOutputOpt(dir, "", args...)
 }
 
-func prepareStage(pkgPath, meta, name, version, sourceTar string) (topdir, script string, cleanup func(), err error) {
+func prepareStage(pkgPath, meta, name, version, sourceTar, releaseSuffix string) (topdir, script string, cleanup func(), err error) {
 	work, err := os.MkdirTemp("", "sfosbuild-")
 	if err != nil {
 		return "", "", nil, err
@@ -1076,6 +1160,13 @@ func prepareStage(pkgPath, meta, name, version, sourceTar string) (topdir, scrip
 	}
 
 	patched := patchVersion(meta, version)
+	if releaseSuffix != "" {
+		patched, err = patchRelease(patched, releaseSuffix)
+		if err != nil {
+			cleanup()
+			return "", "", nil, err
+		}
+	}
 	if sourceTar != "" {
 		rewritten := patchSourceArchive(patched)
 		if rewritten != patched {
@@ -1371,8 +1462,8 @@ LABEL sfosbuild.build-deps-hash=${SFOSBUILD_DEPS_HASH}
 	return runCmd(dockerCmd(args...))
 }
 
-func buildArch(cfg *config, arch, pkgPath, meta, name, version, out, sourceTar string) error {
-	topdir, script, cleanup, err := prepareStage(pkgPath, meta, name, version, sourceTar)
+func buildArch(cfg *config, arch, pkgPath, meta, name, version, out, sourceTar, releaseSuffix string) error {
+	topdir, script, cleanup, err := prepareStage(pkgPath, meta, name, version, sourceTar, releaseSuffix)
 	if err != nil {
 		return err
 	}

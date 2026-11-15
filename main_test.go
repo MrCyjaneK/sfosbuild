@@ -76,6 +76,9 @@ func TestParseArgs(t *testing.T) {
 	if cfg.Version != "5.1.0.11" || cfg.Arches[0] != "armv7hl" {
 		t.Fatalf("%+v", cfg)
 	}
+	if cfg.Stamp {
+		t.Fatal("stamp should default off")
+	}
 	if cfg.Project != dir || cfg.Pkg != yamlPath {
 		t.Fatalf("project %s pkg %s", cfg.Project, cfg.Pkg)
 	}
@@ -117,6 +120,14 @@ func TestParseArgs(t *testing.T) {
 	}
 	if !cfg.Network {
 		t.Fatal("expected network")
+	}
+
+	cfg, err = parseArgs([]string{"--stamp", "5.1.0.11", "aarch64", yamlPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Stamp {
+		t.Fatal("expected stamp")
 	}
 
 	cfg, err = parseArgs([]string{"--help"})
@@ -283,7 +294,7 @@ Sources:
 		t.Fatal(err)
 	}
 
-	top, script, cleanup, err := prepareStage(yamlPath, yaml, "demo", "1.0", "")
+	top, script, cleanup, err := prepareStage(yamlPath, yaml, "demo", "1.0", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +340,7 @@ Source3:        https://example.com/upstream.tar.gz
 		t.Fatal(err)
 	}
 
-	top, _, cleanup, err := prepareStage(specPath, spec, "ffmpeg", "8.1.2", "")
+	top, _, cleanup, err := prepareStage(specPath, spec, "ffmpeg", "8.1.2", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,7 +380,7 @@ func TestPrepareStageRewritesSource0(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(yamlDir, "notes.txt"), []byte("notes"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	top, _, cleanup, err := prepareStage(yamlPath, yaml, "demo", "1.0", archive)
+	top, _, cleanup, err := prepareStage(yamlPath, yaml, "demo", "1.0", archive, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +414,7 @@ func TestPrepareStageRewritesSource0(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(specDir, "enable_decoders"), []byte("dec"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	top, _, cleanup, err = prepareStage(specPath, spec, "ffmpeg", "8.1.2", archive)
+	top, _, cleanup, err = prepareStage(specPath, spec, "ffmpeg", "8.1.2", archive, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +434,7 @@ func TestPrepareStageRewritesSource0(t *testing.T) {
 	}
 
 	// In-place builds do not pack a tarball, so the upstream Source0 name stays.
-	top, _, cleanup, err = prepareStage(specPath, spec, "ffmpeg", "8.1.2", "")
+	top, _, cleanup, err = prepareStage(specPath, spec, "ffmpeg", "8.1.2", "", "")
 	if err == nil {
 		cleanup()
 		t.Fatal("in-place should still require the named Source0 file")
@@ -443,7 +454,7 @@ func TestPrepareStageMissingDeclaredSource(t *testing.T) {
 	if err := os.WriteFile(specPath, []byte(spec), 0644); err != nil {
 		t.Fatal(err)
 	}
-	_, _, cleanup, err := prepareStage(specPath, spec, "ffmpeg", "8.1.2", "")
+	_, _, cleanup, err := prepareStage(specPath, spec, "ffmpeg", "8.1.2", "", "")
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -462,7 +473,7 @@ func TestPrepareStageSource(t *testing.T) {
 	if err := os.WriteFile(yamlPath, []byte(yaml), 0644); err != nil {
 		t.Fatal(err)
 	}
-	top, _, cleanup, err := prepareStage(yamlPath, yaml, "srcpkg", "2", "")
+	top, _, cleanup, err := prepareStage(yamlPath, yaml, "srcpkg", "2", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1382,6 +1393,7 @@ func TestUsage(t *testing.T) {
 		"--in-place",
 		"--source",
 		"--network",
+		"--stamp",
 		"unless --network",
 		"device ~/.sfosbuild-os-version",
 		"--network=none",
@@ -1390,5 +1402,227 @@ func TestUsage(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Fatalf("help missing %q", want)
 		}
+	}
+}
+
+func TestPatchRelease(t *testing.T) {
+	suffix := "20261115091703.482"
+	for _, release := range []string{"1", "1.2", "1%{?dist}"} {
+		in := "Version: 1.2.3\nRelease: " + release + "\n"
+		got, err := patchRelease(in, suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if specField(got, "Version") != "1.2.3" {
+			t.Fatalf("version changed: %q", got)
+		}
+		if specField(got, "Release") != release+"."+suffix {
+			t.Fatalf("release %q -> %q", release, specField(got, "Release"))
+		}
+	}
+
+	spec := "" +
+		"Name: demo\n" +
+		"Version: 1.2.3\n" +
+		"Release:        1\n" +
+		"# Release: 9\n" +
+		"%package libs\n" +
+		"Release: 2\n" +
+		"%changelog\n" +
+		"* Sun Nov 15 2026 Name - 1.2.3-1\n" +
+		"- kept the Release field in the note\n"
+	got, err := patchRelease(spec, suffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "Release:        1."+suffix+"\n") {
+		t.Fatalf("spacing lost:\n%s", got)
+	}
+	if !strings.Contains(got, "# Release: 9\n") {
+		t.Fatalf("comment changed:\n%s", got)
+	}
+	if !strings.Contains(got, "Release: 2."+suffix+"\n") {
+		t.Fatalf("subpackage release:\n%s", got)
+	}
+	if !strings.Contains(got, "- kept the Release field in the note\n") {
+		t.Fatalf("changelog changed:\n%s", got)
+	}
+	if strings.Count(got, suffix) != 2 {
+		t.Fatalf("suffix count:\n%s", got)
+	}
+	if specField(got, "Version") != "1.2.3" {
+		t.Fatalf("version %q", specField(got, "Version"))
+	}
+
+	if _, err := patchRelease("Name: demo\nVersion: 1\n# Release: 1\n", suffix); err == nil {
+		t.Fatal("comment-only Release should fail")
+	}
+	if _, err := patchRelease("Name: demo\nVersion: 1\n", suffix); err == nil {
+		t.Fatal("missing Release should fail")
+	}
+
+	plain := "Version: 1.0\nRelease: 1\n"
+	ver := patchVersion(plain, "9.9")
+	if ver != "Version:    9.9\nRelease: 1\n" {
+		t.Fatalf("patchVersion rewrote release: %q", ver)
+	}
+	if strings.Contains(ver, suffix) {
+		t.Fatalf("patchVersion contains the suffix: %q", ver)
+	}
+}
+
+func TestPrepareStageReleaseSuffix(t *testing.T) {
+	dir := t.TempDir()
+	spec := "Name: demo\nVersion: 1.0\nRelease: 1\n"
+	specPath := filepath.Join(dir, "demo.spec")
+	if err := os.WriteFile(specPath, []byte(spec), 0644); err != nil {
+		t.Fatal(err)
+	}
+	top, _, cleanup, err := prepareStage(specPath, spec, "demo", "1.0", "", "20261115091703.482")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	body, err := os.ReadFile(filepath.Join(top, "SPECS", "demo.spec"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if specField(string(body), "Release") != "1.20261115091703.482" {
+		t.Fatalf("staged release %q", specField(string(body), "Release"))
+	}
+	if specField(string(body), "Version") != "1.0" {
+		t.Fatalf("staged version %q", body)
+	}
+
+	top, _, cleanup, err = prepareStage(specPath, spec, "demo", "1.0", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	body, err = os.ReadFile(filepath.Join(top, "SPECS", "demo.spec"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if specField(string(body), "Release") != "1" {
+		t.Fatalf("unstamped release %q", specField(string(body), "Release"))
+	}
+}
+
+func gitAt(t *testing.T, dir, date string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	env := append(os.Environ(),
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+	)
+	if date != "" {
+		env = append(env, "GIT_AUTHOR_DATE="+date, "GIT_COMMITTER_DATE="+date)
+	}
+	cmd.Env = env
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %s", args, out)
+	}
+}
+
+func TestReleaseStamp(t *testing.T) {
+	t.Setenv("SFOSBUILD_RELEASE_COMMIT", "")
+	dir := t.TempDir()
+	gitAt(t, dir, "", "init")
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(t, dir, "", "add", "f")
+	gitAt(t, dir, "2026-11-15 09:17:03 +0000", "commit", "-m", "init")
+
+	got, err := releaseStamp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "20261115091703.1" {
+		t.Fatalf("stamp %q", got)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("dirty\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err = releaseStamp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "20261115091703.1" {
+		t.Fatalf("dirty tree changed stamp to %q", got)
+	}
+}
+
+func TestReleaseStampParent(t *testing.T) {
+	t.Setenv("SFOSBUILD_RELEASE_COMMIT", "")
+	dir := t.TempDir()
+	gitAt(t, dir, "", "init")
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(t, dir, "", "add", "f")
+	gitAt(t, dir, "2026-11-15 09:17:03 +0000", "commit", "-m", "first")
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("b\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(t, dir, "", "add", "f")
+	gitAt(t, dir, "2026-11-15 11:04:22 +0000", "commit", "-m", "second")
+
+	head, err := releaseStamp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != "20261115110422.2" {
+		t.Fatalf("HEAD stamp %q", head)
+	}
+
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "HEAD~1")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SFOSBUILD_RELEASE_COMMIT", strings.TrimSpace(string(out)))
+	got, err := releaseStamp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "20261115091703.1" {
+		t.Fatalf("parent stamp %q", got)
+	}
+}
+
+func TestReleaseStampShallow(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+	t.Setenv("GIT_CONFIG_VALUE_0", "always")
+	t.Setenv("SFOSBUILD_RELEASE_COMMIT", "")
+
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	shallow := filepath.Join(root, "shallow")
+	if err := os.MkdirAll(src, 0755); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(t, src, "", "init")
+	if err := os.WriteFile(filepath.Join(src, "f"), []byte("a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(t, src, "", "add", "f")
+	gitAt(t, src, "2026-11-15 09:17:03 +0000", "commit", "-m", "first")
+	if err := os.WriteFile(filepath.Join(src, "f"), []byte("b\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(t, src, "", "add", "f")
+	gitAt(t, src, "2026-11-15 11:04:22 +0000", "commit", "-m", "second")
+
+	if _, err := releaseStamp(src); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(t, root, "", "clone", "--depth", "1", "file://"+src, shallow)
+	_, err := releaseStamp(shallow)
+	if err == nil || !strings.Contains(err.Error(), "shallow") {
+		t.Fatalf("shallow: %v", err)
 	}
 }

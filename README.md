@@ -23,6 +23,8 @@ The last argument is one spectacle yaml or rpm spec, not the repository director
 
 `--in-place` is the same working-tree rpmbuild deploy already uses. Run `make clean` and `make distclean` in the project first so a previous architecture's build cache is not packaged. Deploy installs the package it built.
 
+With `--stamp`, the built release is `<spec release>.<committer YYYYMMDDHHMMSS UTC>.<rev-list count>`. `SFOSBUILD_RELEASE_COMMIT` selects the commit. The default commit is `HEAD`. Without the flag, `Release` is unchanged.
+
 ## Hooks
 
 If you need to do some preparations inside of the image `.sfosbuild/image/*.sh`
