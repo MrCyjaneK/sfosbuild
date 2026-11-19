@@ -22,16 +22,10 @@ import (
 	"time"
 )
 
-//go:embed Dockerfile unpack.sh prepare.sh rpmbuild.sh install-builddeps.sh
+//go:embed Dockerfile bootstrap.sh prepare.sh rpmbuild.sh install-builddeps.sh
 var embedded embed.FS
 
 const dockerRunLabel = "sfosbuild=1"
-
-var knownMD5 = map[string]string{
-	"5.1.0.11/aarch64": "24b40e5e6c1366996dc5a4a69a46e3b3",
-	"5.1.0.11/armv7hl": "a2ad4336d5466cced44d57c21c32e8ce",
-	"5.1.0.11/i486":    "753619f8d84c6c6d7e83f37ee735c298",
-}
 
 var archPlatform = map[string]string{
 	"aarch64": "linux/arm64",
@@ -210,7 +204,7 @@ func usage(w io.Writer) {
   sfosbuild shell [options] <sfos-version> <arch> [command...]
   sfosbuild deploy [options] <user@host> <yaml>
 
-Build Sailfish OS RPMs, deploy to a device, or open a shell in SDK target containers.
+Build Sailfish OS RPMs, deploy to a device, or open a shell in a release rootfs.
 
 Workspace:
   Walks up from the current directory looking for .sfosbuild/. That directory
@@ -222,15 +216,15 @@ Workspace:
   and shell).
 
   .sfosbuild/image/*.sh
-      Run during SDK image build, in sorted order, after the target is
-      unpacked. The image is rebuilt when these scripts change (or with
-      --rebuild).
+      Run during image build, in sorted order, after the rootfs is installed
+      from the release repositories. The image is rebuilt when these scripts
+      change (or with --rebuild).
 
 Commands:
   build (default)  Package a project with specify + rpmbuild
   deploy           ssh uname -m and /etc/os-release, build, install the RPMs for that architecture
                    device ~/.sfosbuild-os-version (x.x.x.x) overrides the probed OS version
-  shell            docker run -i -t -v $HOME:$HOME:ro -v $wd:$wd -v m_root:/root -w $PWD in the SDK image
+  shell            docker run -i -t -v $HOME:$HOME:ro -v $wd:$wd -v m_root:/root -w $PWD in the rootfs image
                    No command -> interactive sh -i. Rebuilds the image if hooks changed.
 
 Examples:
@@ -246,7 +240,7 @@ Options:
   --in-place           rpmbuild --build-in-place on the working tree
   --source             also build the .src.rpm and copy SRPMS to the output directory
   --network            let the rpmbuild container reach the internet
-  --rebuild            rebuild SDK images even if they exist
+  --rebuild            rebuild rootfs images even if they exist
   --stamp              append .<committer time>.<rev-list count> to Release
   --image-prefix NAME  docker image prefix (default: sfosbuild)
   -h, --help           show this help
@@ -256,7 +250,7 @@ Architectures: aarch64, armv7hl (armv7a), i486, all
 
 The last argument is one spectacle yaml or rpm spec. A file inside rpm/
 packages the directory that contains rpm/. Any other file packages the
-directory that contains it. specify runs in the SDK image to generate the
+directory that contains it. specify runs in the image to generate the
 spec. build packages the git HEAD tree as a .tar.bz2 Source0. Submodule
 commits recorded in that tree are packed too. A commit that is not in the
 local module git dir is fetched. update=none in .gitmodules is ignored, so
@@ -265,7 +259,10 @@ entry in a yaml, that names another tar compression is rewritten to
 .tar.bz2. Other Source and Patch files named by the spec are copied too,
 when they sit next to the spec. The rest of the tree is not. It then runs
 a clean rpmbuild. That container runs with --network=none unless --network
-is set. SDK image setup and build-requires install still use the network.
+is set. Rootfs setup and build-requires install still use the network.
+The rootfs for a version is installed from the public release repositories
+(jolla, hotfixes, sdk, adaptation-common), not from a Platform SDK target
+tarball.
 --in-place and deploy use
 rpmbuild --build-in-place on the working tree. Drop the previous arch's
 build tree first (make clean and make distclean) so that cache is not packaged.
@@ -479,6 +476,19 @@ func imageHooksDockerfile(scripts []string) string {
 
 func imageScriptsHash(root string) string {
 	h := sha256.New()
+	// The rootfs recipe is part of the image identity, so an existing SDK
+	// target image is rebuilt when the way the rootfs is installed changes.
+	for _, name := range []string{"Dockerfile", "bootstrap.sh", "prepare.sh"} {
+		data, err := embedded.ReadFile(name)
+		if err != nil {
+			io.WriteString(h, name)
+			io.WriteString(h, err.Error())
+		} else {
+			io.WriteString(h, name)
+			h.Write(data)
+		}
+		h.Write([]byte{0})
+	}
 	for _, f := range imageScriptPaths(root) {
 		io.WriteString(h, filepath.Base(f))
 		data, err := os.ReadFile(f)
@@ -1297,7 +1307,7 @@ func ensureImage(cfg *config, arch string) error {
 		return nil
 	}
 	if imageExists(tag) && !cfg.Rebuild {
-		log.Printf("image hooks changed; rebuilding %s", tag)
+		log.Printf("image definition changed; rebuilding %s", tag)
 	}
 	return buildImage(tag, cfg.Version, arch, cfg.Root, hash)
 }
@@ -1338,7 +1348,7 @@ func buildImage(tag, version, arch, root, hash string) error {
 	}
 	defer os.RemoveAll(ctx)
 	scripts := imageScriptPaths(root)
-	for _, f := range []string{"unpack.sh", "prepare.sh"} {
+	for _, f := range []string{"bootstrap.sh", "prepare.sh"} {
 		data, err := embedded.ReadFile(f)
 		if err != nil {
 			return err
@@ -1367,20 +1377,18 @@ func buildImage(tag, version, arch, root, hash string) error {
 			return err
 		}
 	}
-	md5 := knownMD5[version+"/"+arch]
-	log.Printf("building %s (downloads SDK target)", tag)
-	args := dockerBuildArgs(tag, ctx, version, arch, platform, md5, hash)
+	log.Printf("building %s (release repos)", tag)
+	args := dockerBuildArgs(tag, ctx, version, arch, platform, hash)
 	return runCmd(dockerCmd(args...))
 }
 
-func dockerBuildArgs(tag, context, version, arch, platform, md5, hash string) []string {
+func dockerBuildArgs(tag, context, version, arch, platform, hash string) []string {
 	return []string{
 		"build",
 		"--platform", platform,
 		"--build-arg", "SFOS_VERSION=" + version,
 		"--build-arg", "SFOS_ARCH=" + arch,
 		"--build-arg", "SFOS_PLATFORM=" + platform,
-		"--build-arg", "TARGET_7Z_MD5=" + md5,
 		"--build-arg", "SFOSBUILD_IMAGE_HASH=" + hash,
 		"-t", tag,
 		context,

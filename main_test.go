@@ -925,13 +925,12 @@ func tarFiles(t *testing.T, path string) map[string]string {
 }
 
 func TestDockerArgs(t *testing.T) {
-	args := dockerBuildArgs("sfosbuild:5.1.0.11-i486", "/ctx", "5.1.0.11", "i486", "linux/386", "abc", "deadbeef")
+	args := dockerBuildArgs("sfosbuild:5.1.0.11-i486", "/ctx", "5.1.0.11", "i486", "linux/386", "deadbeef")
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"--platform linux/386",
 		"--build-arg SFOS_VERSION=5.1.0.11",
 		"--build-arg SFOS_ARCH=i486",
-		"--build-arg TARGET_7Z_MD5=abc",
 		"--build-arg SFOSBUILD_IMAGE_HASH=deadbeef",
 		"-t sfosbuild:5.1.0.11-i486",
 	} {
@@ -1398,6 +1397,7 @@ func TestUsage(t *testing.T) {
 		"device ~/.sfosbuild-os-version",
 		"--network=none",
 		"<prefix>_<workspace>",
+		"release repositories",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("help missing %q", want)
