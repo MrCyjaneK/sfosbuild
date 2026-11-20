@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1535,22 +1536,22 @@ func TestReleaseStamp(t *testing.T) {
 	gitAt(t, dir, "", "add", "f")
 	gitAt(t, dir, "2026-11-15 09:17:03 +0000", "commit", "-m", "init")
 
-	got, err := releaseStamp(dir)
+	got, err := releaseStamp(dir, "5.1.0.11")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "20261115091703.1" {
+	if got != "20261115091703.1.5.1.0.11" {
 		t.Fatalf("stamp %q", got)
 	}
 
 	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("dirty\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	got, err = releaseStamp(dir)
+	got, err = releaseStamp(dir, "5.1.0.11")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "20261115091703.1" {
+	if got != "20261115091703.1.5.1.0.11" {
 		t.Fatalf("dirty tree changed stamp to %q", got)
 	}
 }
@@ -1570,11 +1571,11 @@ func TestReleaseStampParent(t *testing.T) {
 	gitAt(t, dir, "", "add", "f")
 	gitAt(t, dir, "2026-11-15 11:04:22 +0000", "commit", "-m", "second")
 
-	head, err := releaseStamp(dir)
+	head, err := releaseStamp(dir, "5.1.0.11")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if head != "20261115110422.2" {
+	if head != "20261115110422.2.5.1.0.11" {
 		t.Fatalf("HEAD stamp %q", head)
 	}
 
@@ -1584,11 +1585,11 @@ func TestReleaseStampParent(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("SFOSBUILD_RELEASE_COMMIT", strings.TrimSpace(string(out)))
-	got, err := releaseStamp(dir)
+	got, err := releaseStamp(dir, "5.1.0.11")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "20261115091703.1" {
+	if got != "20261115091703.1.5.1.0.11" {
 		t.Fatalf("parent stamp %q", got)
 	}
 }
@@ -1617,12 +1618,75 @@ func TestReleaseStampShallow(t *testing.T) {
 	gitAt(t, src, "", "add", "f")
 	gitAt(t, src, "2026-11-15 11:04:22 +0000", "commit", "-m", "second")
 
-	if _, err := releaseStamp(src); err != nil {
+	if _, err := releaseStamp(src, "5.1.0.11"); err != nil {
 		t.Fatal(err)
 	}
 	gitAt(t, root, "", "clone", "--depth", "1", "file://"+src, shallow)
-	_, err := releaseStamp(shallow)
+	_, err := releaseStamp(shallow, "5.1.0.11")
 	if err == nil || !strings.Contains(err.Error(), "shallow") {
 		t.Fatalf("shallow: %v", err)
 	}
+}
+
+func TestReleaseStampOSVersion(t *testing.T) {
+	for _, v := range []string{"", "5.1", "5.1.0", "latest", "5.1.0.11-1"} {
+		if _, err := releaseStamp(t.TempDir(), v); err == nil || !strings.Contains(err.Error(), "x.x.x.x") {
+			t.Fatalf("version %q: %v", v, err)
+		}
+	}
+
+	t.Setenv("SFOSBUILD_RELEASE_COMMIT", "")
+	dir := t.TempDir()
+	gitAt(t, dir, "", "init")
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(t, dir, "", "add", "f")
+	gitAt(t, dir, "2026-11-15 09:17:03 +0000", "commit", "-m", "init")
+
+	older, err := releaseStamp(dir, "4.6.0.15")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer, err := releaseStamp(dir, "5.1.0.11")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if older != "20261115091703.1.4.6.0.15" || newer != "20261115091703.1.5.1.0.11" {
+		t.Fatalf("stamps %q %q", older, newer)
+	}
+	// Same commit: a newer OS sorts after an older one, and after a stamp
+	// from before the OS version was included, so the rebuild updates it.
+	if cmpNumericRelease("20261115091703.1", older) >= 0 {
+		t.Fatalf("old stamp not older than %q", older)
+	}
+	if cmpNumericRelease(older, newer) >= 0 {
+		t.Fatalf("%q not older than %q", older, newer)
+	}
+	if cmpNumericRelease("20261115091703.1.5.1.0.9", "20261115091703.1.5.1.0.11") >= 0 {
+		t.Fatal("5.1.0.9 not older than 5.1.0.11")
+	}
+	// A newer commit still wins on an older OS.
+	if cmpNumericRelease(newer, "20261115110422.2.4.6.0.15") >= 0 {
+		t.Fatal("newer commit on an older OS did not sort newer")
+	}
+}
+
+// cmpNumericRelease compares dotted numeric release suffixes the way
+// rpmvercmp does: each component is a number, and a longer suffix is newer.
+func cmpNumericRelease(a, b string) int {
+	as := strings.Split(a, ".")
+	bs := strings.Split(b, ".")
+	n := len(as)
+	if len(bs) < n {
+		n = len(bs)
+	}
+	for i := 0; i < n; i++ {
+		av, _ := strconv.Atoi(as[i])
+		bv, _ := strconv.Atoi(bs[i])
+		if av != bv {
+			return av - bv
+		}
+	}
+	return len(as) - len(bs)
 }

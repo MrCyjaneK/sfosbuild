@@ -43,7 +43,7 @@ type config struct {
 	InPlace     bool // working tree via rpmbuild --build-in-place; otherwise git archive of HEAD and local submodules
 	Source      bool // rpmbuild -ba and copy SRPMS into the output directory
 	Network     bool // rpmbuild container uses the default docker network; otherwise --network=none
-	Stamp       bool // append .<committer time>.<rev-list count> to Release
+	Stamp       bool // append .<committer time>.<rev-list count>.<os version> to Release
 	ImagePrefix string
 	Root        string // $wd: directory that contains .sfosbuild/
 	WorkDir     string // host cwd, used as docker -w
@@ -114,7 +114,7 @@ func buildPkg(cfg *config, pkgPath, outAbs string) error {
 	}
 	var releaseSuffix string
 	if cfg.Stamp {
-		releaseSuffix, err = releaseStamp(cfg.Project)
+		releaseSuffix, err = releaseStamp(cfg.Project, cfg.Version)
 		if err != nil {
 			return err
 		}
@@ -241,7 +241,7 @@ Options:
   --source             also build the .src.rpm and copy SRPMS to the output directory
   --network            let the rpmbuild container reach the internet
   --rebuild            rebuild rootfs images even if they exist
-  --stamp              append .<committer time>.<rev-list count> to Release
+  --stamp              append .<committer time>.<rev-list count>.<os version> to Release
   --image-prefix NAME  docker image prefix (default: sfosbuild)
   -h, --help           show this help
 
@@ -664,11 +664,17 @@ func patchVersion(spec, version string) string {
 	return strings.Join(lines, "\n")
 }
 
-// releaseStamp is .<YYYYMMDDHHMMSS>.<count> without the leading dot.
+// releaseStamp is <YYYYMMDDHHMMSS>.<count>.<os version> without a leading dot.
 // The time is the committer time of the chosen commit, in UTC. The count is
-// git rev-list --count of that same commit. SFOSBUILD_RELEASE_COMMIT selects
-// it; otherwise the commit is HEAD.
-func releaseStamp(project string) (string, error) {
+// git rev-list --count of that same commit. The OS version is the sfos
+// version this build targets (x.x.x.x). It trails the commit stamp, so a
+// newer commit still wins, and a rebuild of the same commit for a newer OS
+// compares newer than the package built before. SFOSBUILD_RELEASE_COMMIT
+// selects the commit; otherwise the commit is HEAD.
+func releaseStamp(project, osVersion string) (string, error) {
+	if !validOSVersion(osVersion) {
+		return "", fmt.Errorf("os version %q is not x.x.x.x", osVersion)
+	}
 	shallow, err := gitOutput(project, "rev-parse", "--is-shallow-repository")
 	if err != nil {
 		return "", err
@@ -700,7 +706,7 @@ func releaseStamp(project string) (string, error) {
 	if count == "" {
 		return "", fmt.Errorf("empty rev-list count for %s", commit)
 	}
-	return when + "." + count, nil
+	return when + "." + count + "." + osVersion, nil
 }
 
 // patchRelease appends .<suffix> to every Release tag. Comment lines and
